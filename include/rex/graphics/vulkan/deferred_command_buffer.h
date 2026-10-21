@@ -104,6 +104,14 @@ class DeferredCommandBuffer {
     args.pipeline = pipeline;
   }
 
+  // Binds the pipeline behind a VulkanPipelineCache handle that a worker may
+  // still be building; the replay waits for it (or skips the draws after it).
+  void CmdBindPendingGraphicsPipeline(void* handle) {
+    auto& args = *reinterpret_cast<ArgsBindPendingGraphicsPipeline*>(WriteCommand(
+        Command::kBindPendingGraphicsPipeline, sizeof(ArgsBindPendingGraphicsPipeline)));
+    args.handle = handle;
+  }
+
   void CmdVkBindVertexBuffers(uint32_t first_binding, uint32_t binding_count,
                               const VkBuffer* buffers, const VkDeviceSize* offsets) {
     size_t arguments_size = rex::align(sizeof(ArgsVkBindVertexBuffers), alignof(VkBuffer));
@@ -369,6 +377,12 @@ class DeferredCommandBuffer {
     std::memcpy(args.blend_constants, blend_constants, sizeof(float) * 4);
   }
 
+  void CmdVkSetFragmentShadingRateKHR(VkExtent2D fragment_size) {
+    auto& args = *reinterpret_cast<ArgsVkSetFragmentShadingRateKHR*>(WriteCommand(
+        Command::kVkSetFragmentShadingRateKHR, sizeof(ArgsVkSetFragmentShadingRateKHR)));
+    args.fragment_size = fragment_size;
+  }
+
   void CmdVkSetDepthBias(float depth_bias_constant_factor, float depth_bias_clamp,
                          float depth_bias_slope_factor) {
     auto& args = *reinterpret_cast<ArgsVkSetDepthBias*>(
@@ -427,6 +441,7 @@ class DeferredCommandBuffer {
     kVkBindDescriptorSets,
     kVkBindIndexBuffer,
     kVkBindPipeline,
+    kBindPendingGraphicsPipeline,
     kVkBindVertexBuffers,
     kVkClearAttachments,
     kVkClearColorImage,
@@ -452,6 +467,7 @@ class DeferredCommandBuffer {
     kVkEndDebugLabel,
     kVkSetBlendConstants,
     kVkSetDepthBias,
+    kVkSetFragmentShadingRateKHR,
     kVkSetScissor,
     kVkSetStencilCompareMask,
     kVkSetStencilReference,
@@ -516,6 +532,10 @@ class DeferredCommandBuffer {
   struct ArgsVkBindPipeline {
     VkPipelineBindPoint pipeline_bind_point;
     VkPipeline pipeline;
+  };
+
+  struct ArgsBindPendingGraphicsPipeline {
+    void* handle;
   };
 
   struct ArgsVkBindVertexBuffers {
@@ -664,6 +684,10 @@ class DeferredCommandBuffer {
 
   struct ArgsVkSetBlendConstants {
     float blend_constants[4];
+  };
+
+  struct ArgsVkSetFragmentShadingRateKHR {
+    VkExtent2D fragment_size;
   };
 
   struct ArgsVkSetDepthBias {

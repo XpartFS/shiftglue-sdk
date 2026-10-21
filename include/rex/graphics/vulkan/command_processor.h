@@ -286,6 +286,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IsFh1RenderingOpen(uint64_t id) const {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
+  bool in_render_pass() const { return in_render_pass_; }
   system::GraphicsShaderTranslationObserver GetShaderTranslationObserver() const;
   // Submits the open submission, waits for every queue operation and reopens
   // the submission if one was open (FH1 resolve read-backs).
@@ -294,6 +295,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   // fh1_frame_replay: replays a frame dump (recorded on D3D12) on Vulkan and
   // ends the process.
   void RunRequestedFrameReplay() override;
+  void RestoreFrameDumpRegisters(std::span<const uint32_t> registers) override;
+  std::shared_ptr<Fh1FrameInspector> frame_inspector() const override { return inspector_; }
+  bool OpenInspectionDump(const std::filesystem::path& path, Fh1InspectionView view) override;
+  Fh1InspectionView inspection_view() const { return inspection_view_; }
+  void SetInspectionView(Fh1InspectionView view) {
+    inspection_view_ = view;
+    std::fill_n(pipeline_memos_.get(), kStateMemoCount, PipelineMemo());
+  }
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open.
@@ -311,6 +320,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDescriptorSetLayout GetTextureDescriptorSetLayout(bool is_vertex, size_t texture_count,
                                                       size_t sampler_count);
   // The returned reference is valid until a cache clear.
+  // The persistent driver pipeline cache for pipelines created outside the
+  // pipeline cache (FH1 native executor transfers and resolves), or null.
+  VkPipelineCache UsePersistentVkPipelineCache() {
+    return pipeline_cache_ ? pipeline_cache_->UsePersistentVkPipelineCache() : VK_NULL_HANDLE;
+  }
+  // A pending pipeline bind of the replayed submission: the pipeline once a
+  // worker has built it, or VK_NULL_HANDLE to skip its draws.
+  VkPipeline AwaitPendingGraphicsPipeline(void* handle) const;
   const VulkanPipelineCache::PipelineLayoutProvider* GetPipelineLayout(size_t texture_count_pixel,
                                                                        size_t sampler_count_pixel,
                                                                        size_t texture_count_vertex,
@@ -373,6 +390,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
   void FlushCpuVisibleResults() override;
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  void PublishGuestCompletion(std::function<void()> completion) override;
+  bool AwaitGuestGpuCompletion() override {
+    const bool completed = AwaitAllQueueOperationsCompletion();
+    return completed && !device_lost_;
+  }
+#endif
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -426,6 +450,23 @@ class VulkanCommandProcessor : public CommandProcessor {
     // With a tape: the submission's number.
     uint64_t submission = 0;
   };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  bool StartCompletionWorker();
+  void StopCompletionWorker();
+  void CompletionWorkerMain();
+  struct CompletionJob { uint64_t value; std::function<void()> callback; };
+  VkSemaphore completion_timeline_ = VK_NULL_HANDLE;
+  PFN_vkWaitSemaphores completion_wait_ = nullptr;
+  uint64_t completion_issued_ = 0;
+  std::atomic<uint64_t> completion_retired_{0};
+  std::atomic<uint64_t> completion_pending_{0};
+  system::object_ref<system::XHostThread> completion_worker_;
+  std::mutex completion_mutex_;
+  std::condition_variable completion_wake_;
+  std::deque<CompletionJob> completion_jobs_;
+  bool completion_stop_ = false;
+  bool completion_last_mode_ = false;
+#endif
   // Replays `tape` into `command_buffer` and submits it signaling `fence`;
   // on failure still signals the fence (an empty submission) unless the
   // device is lost, so waits for it end.
@@ -791,6 +832,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   };
   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
   void DestroySwapFxaaSourceImage();
+  // UP-1.7: (re)creates the object slot image at the given size; it starts
+  // undefined, and the swap's camera pass initialises it.
+  bool CreateObjectSlotImage(uint32_t width, uint32_t height);
+  void DestroyObjectSlotImage();
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
@@ -1037,6 +1082,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unique_ptr<Fh1NativeExecutor> fh1_native_executor_;
   // fh1_frame_dump_frame: records one frame for offline replay (at 1x).
   std::unique_ptr<Fh1FrameDump> frame_dump_;
+  std::shared_ptr<Fh1FrameInspector> inspector_ = std::make_shared<Fh1FrameInspector>();
+  Fh1InspectionView inspection_view_ = Fh1InspectionView::kColor;
+  std::atomic<bool> inspection_replay_pending_{false};
+  void RunFrameReplay(const std::filesystem::path& path, bool inspect, Fh1InspectionView view);
+  bool ResetInspectionReplay();
   // Identifies the open dynamic rendering scope of the executor (0: none).
   uint64_t current_fh1_rendering_id_ = 0;
   bool debug_labels_ = false;
@@ -1058,6 +1108,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   double sampler_mip_lod_bias_ = 0.0;
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
+  // R32_UINT over the whole shared memory (vulkan_shared_memory_texel_buffer).
+  VkBufferView shared_memory_texel_buffer_view_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
@@ -1128,6 +1180,77 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
+  // present_hdr: the HUD's coverage into the guest output's alpha
+  // (hdr_hud_mask.cs.glsl), created on first use.
+  bool EnsureSwapHudMask();
+  bool swap_hud_mask_failed_ = false;
+  VkDescriptorSetLayout swap_hud_mask_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_hud_mask_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_hud_mask_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_hud_mask_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hud_mask_descriptor_sets_{};
+  // UP-1.2: the guest output without the HUD for a temporal upscaler (the
+  // pre-HUD snapshot through the gamma ramp, the HUD mask in alpha), with
+  // its own descriptor sets so it can run beside present_hdr's mask.
+  bool EnsureSwapHudless();
+  bool swap_hudless_failed_ = false;
+  VkDescriptorPool swap_hudless_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_source_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_destination_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_mask_sets_{};
+  // UP-1.3 and UP-1.4: the guest output's depth and camera motion from the
+  // executor's depth snapshot and reprojection (fh1_camera.cpp), written by
+  // swap_camera_pipeline_ (EnsureSwapCamera, command_processor.cpp).
+  bool EnsureSwapCamera();
+  bool swap_camera_failed_ = false;
+  VkDescriptorSetLayout swap_camera_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_camera_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_camera_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_camera_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_camera_sets_{};
+  // UP-1.7: the scene's object slots (R32_UINT, (depth << 8) | slot, the
+  // nearest fragment's), written by scene pixel shaders through binding
+  // kObjectSlotImageBinding of the shared memory set when not using
+  // fragment shader interlock, read and cleared by the swap's camera pass,
+  // and the swapped frame's reprojection by slot for that pass.
+  VkImage object_slot_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory object_slot_image_memory_ = VK_NULL_HANDLE;
+  VkImageView object_slot_image_view_ = VK_NULL_HANDLE;
+  uint32_t object_slot_image_width_ = 0;
+  uint32_t object_slot_image_height_ = 0;
+  uint32_t object_slot_wanted_width_ = 0;
+  uint32_t object_slot_wanted_height_ = 0;
+  bool object_slot_image_initialized_ = false;
+  bool object_slot_set_binding_ = false;
+  uint32_t object_slot_draws_ = 0;
+  uint32_t object_slot_fallback_draws_ = 0;
+  // Draws of the current frame recorded with a pipeline still being built
+  // (vulkan_async_pipeline_bind_on_replay).
+  uint32_t pending_pipeline_binds_ = 0;
+  std::array<VkBuffer, kMaxFramesInFlight> swap_object_table_buffers_{};
+  std::array<VkDeviceMemory, kMaxFramesInFlight> swap_object_table_memories_{};
+  std::array<uint32_t, kMaxFramesInFlight> swap_object_table_memory_types_{};
+  std::array<void*, kMaxFramesInFlight> swap_object_table_mappings_{};
+  // Scene-only post (scene_post.cpp): FXAA and a host 3D LUT on the pixels
+  // the HUD left alone, told apart with the pre-HUD snapshot.
+  bool EnsureSwapScenePost();
+  // Loads scene_lut_path when it changed and records the upload; false
+  // without a usable LUT (an identity one is bound then).
+  bool UpdateSceneLut();
+  void DestroySceneLut();
+  bool swap_scene_post_failed_ = false;
+  VkDescriptorSetLayout swap_scene_post_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_scene_post_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_scene_post_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_scene_post_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_scene_post_descriptor_sets_{};
+  std::string scene_lut_path_;
+  bool scene_lut_loaded_ = false;
+  bool scene_lut_real_ = false;
+  uint32_t scene_lut_size_ = 0;
+  VkImage scene_lut_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory scene_lut_memory_ = VK_NULL_HANDLE;
+  VkImageView scene_lut_view_ = VK_NULL_HANDLE;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
   VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;
@@ -1243,6 +1366,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool dynamic_stencil_write_mask_back_update_needed_;
   bool dynamic_stencil_reference_front_update_needed_;
   bool dynamic_stencil_reference_back_update_needed_;
+  VkExtent2D dynamic_fragment_shading_rate_ = {1, 1};
+  bool dynamic_fragment_shading_rate_update_needed_ = true;
+  // The draw's pixel shader kills pixels or its coverage depends on alpha.
+  bool draw_coverage_from_shader_ = false;
 
   // Currently used samplers.
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
@@ -1288,6 +1415,45 @@ class VulkanCommandProcessor : public CommandProcessor {
   struct SamplerCensus {
     uint64_t slots = 0, slot_hits = 0, memo_hits = 0, use_sampler = 0, verified_different = 0;
   } sampler_census_;
+  // NL-3.2: the inputs of the last full sampler stage. A draw with the same
+  // shaders, the same submission and filtering, and none of the fetch
+  // constants its samplers read written since (the texture cache's in-sync
+  // bits, set by the last draw's texture request) keeps current_samplers_*.
+  struct SamplerStageInputs {
+    const VulkanShader* vertex_shader = nullptr;
+    const VulkanShader* pixel_shader = nullptr;
+    uint64_t submission = 0;
+    uint32_t fetch_mask = 0;
+    int32_t anisotropic_override = 0;
+    bool force_trilinear = false;
+    bool fetch_key = false;
+    bool scene_filtering = false;
+    bool valid = false;
+  } sampler_stage_inputs_;
+  // NL-3.2: bumped whenever a draw derives its samplers or requests its
+  // textures in full, so an unchanged value means every draw since kept the
+  // same samplers and texture bindings.
+  uint64_t texture_inputs_generation_ = 0;
+  // NL-3.2: the inputs of the last UpdateBindings texture section; with the
+  // same shaders, layout, frame and texture inputs, its image infos and sets
+  // are the last ones again.
+  struct TextureSectionInputs {
+    const VulkanShader* vertex_shader = nullptr;
+    const VulkanShader* pixel_shader = nullptr;
+    const void* layout = nullptr;
+    uint64_t frame = 0;
+    uint64_t texture_inputs_generation = UINT64_MAX;
+    bool valid = false;
+  } texture_section_inputs_;
+  bool texture_section_skip_allowed_ = false;
+  bool texture_section_verify_ = false;
+  // Verify mode: the samplers a kept sampler stage assumed.
+  std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> verify_samplers_[2];
+  // NL-3.2: draws whose stages found their inputs unchanged.
+  struct UnchangedCensus {
+    uint64_t draws = 0, samplers = 0, textures = 0, texture_sections = 0;
+    uint64_t mismatches = 0, texture_mismatches = 0;
+  } unchanged_census_;
   std::unique_ptr<SamplerParametersMemo[]> sampler_parameters_memos_{
       new SamplerParametersMemo[kSamplerParametersMemoCount]};
   // The last texture descriptor set written per stage (vertex, pixel) and its
@@ -1349,6 +1515,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t interpolator_mask = 0;
     uint32_t ps_param_gen_pos = 0;
     uint32_t depth_control = 0;
+    // UP-1.7: whether the pixel shader writes the object slot.
+    bool object_slot = false;
     SpirvShaderTranslator::Modification vertex_modification;
     SpirvShaderTranslator::Modification pixel_modification;
     VulkanShader::VulkanTranslation* vertex_translation = nullptr;
@@ -1363,9 +1531,196 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t color_mask = 0;
     uint32_t resolution_scale = 0;
     double hud_squeeze = 0.0;
+    double hud_scale = 0.0;
     draw_util::ViewportInfo info;
   };
   std::unique_ptr<ViewportMemo[]> viewport_memos_{new ViewportMemo[kStateMemoCount]};
+
+  // NA-2.4 owned draw programs (vulkan_draw_program.cpp, gpu_d3d_program):
+  // for each run of a pilot list (by buffer and the state it starts in), the
+  // derived state of each of its draws in order. A draw whose state hash,
+  // shaders and draw words match its recorded ones takes the recorded
+  // shaders, primitive processing, translations, pipeline and viewport
+  // instead of deriving them; texture, sampler, target, constant and
+  // binding work stays, since it acts on state outside the draw.
+  //
+  // NA-2.3: an indexed program draw reads its indices from an index
+  // version, a copy of the guest range in a device-local arena made once
+  // per generation of the range: the shared memory's watch on the range
+  // (CPU writes and GPU writes such as resolves) ends a generation. Until
+  // then the draw neither processes nor requests the guest range. A written
+  // version is retired, and its space reused once the last submission that
+  // read it has completed: no fence over the arena.
+  struct IndexVersion {
+    uint32_t guest_base = 0;
+    uint32_t bytes = 0;
+    VkDeviceSize offset = 0;
+    uint64_t last_submission = 0;
+    uint64_t verify_hash = 0;  // shadow mode: the guest bytes when copied
+    bool alive = false;
+    // Set by the watch callback (guest or GPU thread, global lock held).
+    std::atomic<bool> written{false};
+  };
+  struct ProgramDraw {
+    bool valid = false;
+    // Inputs: the draw is the recorded one while these hold.
+    uint64_t memo_state = 0;
+    const void* active_vertex_shader = nullptr;
+    const void* active_pixel_shader = nullptr;
+    uint32_t prim_type = 0;
+    uint32_t index_count = 0;
+    uint32_t initiator = 0;
+    uint32_t dma_base = 0;
+    uint32_t dma_size = 0;
+    uint32_t resolution_scale = 0;
+    double hud_squeeze = 0.0;
+    double hud_scale = 0.0;
+    bool major_mode_explicit = false;
+    bool object_slot = false;
+    bool hud_draw = false;
+    // Outputs.
+    VulkanShader* vertex_shader = nullptr;
+    VulkanShader* pixel_shader = nullptr;
+    bool primitive_polygonal = false;
+    bool is_rasterization_done = false;
+    bool coverage_from_shader = false;
+    reg::RB_DEPTHCONTROL depth_control;
+    uint32_t color_mask = 0;
+    PrimitiveProcessor::ProcessingResult primitive;
+    SpirvShaderTranslator::Modification vertex_modification;
+    SpirvShaderTranslator::Modification pixel_modification;
+    VulkanShader::VulkanTranslation* vertex_translation = nullptr;
+    VulkanShader::VulkanTranslation* pixel_translation = nullptr;
+    uint32_t render_pass_key = 0;
+    void* pipeline_handle = nullptr;
+    draw_util::ViewportInfo viewport;
+    uint32_t index_version = UINT32_MAX;
+  };
+  // Draws a program keeps at most (a longer list draws the rest as usual).
+  static constexpr uint32_t kMaxProgramDraws = 4096;
+  struct DrawProgram {
+    std::vector<ProgramDraw> draws;
+    uint32_t last_swap = 0;
+    uint64_t runs = 0;
+    // The settings its draws were recorded under, checked once a run: a
+    // change drops the draws. The derivation reads them, but they only
+    // change between frames.
+    uint32_t resolution_scale = 0;
+    double hud_squeeze = 0.0;
+    double hud_scale = 0.0;
+    bool object_motion = false;
+  };
+  // Key: the buffer (address << 32 | dwords) mixed with the state hash and
+  // shaders at its start, so each pass that runs the list has its own.
+  std::unordered_map<uint64_t, DrawProgram> draw_programs_;
+  DrawProgram* draw_program_ = nullptr;
+  // gpu_d3d_program 4: what a timed run points at (nothing is recorded).
+  DrawProgram draw_program_timed_;
+  // The run's program key, looked up at its first draw (DrawProgramResolve).
+  bool draw_program_pending_ = false;
+  // The run's program has scene object slots to check by draw.
+  bool draw_program_object_motion_ = false;
+  uint64_t draw_program_pending_key_ = 0;
+  struct ProgramCacheEntry {
+    uint64_t key = 0;
+    DrawProgram* program = nullptr;
+  };
+  static constexpr size_t kProgramCacheSize = 256;
+  std::array<ProgramCacheEntry, kProgramCacheSize> draw_program_cache_{};
+  uint32_t draw_program_draw_ = 0;  // the next draw's index in the program
+  uint32_t draw_program_mode_ = 0;
+  uint32_t draw_program_swaps_ = 0;
+  // Versions are never removed (a retired one keeps its slot), so a
+  // program draw's version index stays valid and the watch callback's
+  // pointer too.
+  std::deque<IndexVersion> index_versions_;
+  std::unordered_map<uint64_t, uint32_t> index_version_by_range_;
+  struct RetiredIndexVersion {
+    VkDeviceSize offset, size;
+    // The last submission that reads it, and the current one when retired.
+    uint64_t last_submission, retired_submission;
+    std::chrono::steady_clock::time_point retired;
+  };
+  std::deque<RetiredIndexVersion> retired_index_versions_;
+  // The arena: device-local, first fit over the free ranges (offset, size).
+  static constexpr VkDeviceSize kIndexArenaSize = VkDeviceSize(16) << 20;
+  VkBuffer index_arena_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory index_arena_memory_ = VK_NULL_HANDLE;
+  bool index_arena_failed_ = false;
+  std::map<VkDeviceSize, VkDeviceSize> index_arena_free_;
+  struct DrawProgramStats {
+    uint64_t runs = 0, programs_made = 0, evicted = 0;
+    uint64_t draws = 0, hits = 0, recorded = 0, unrecordable = 0;
+    uint64_t miss[6] = {};  // by DrawProgramMiss
+    uint64_t index_hits = 0, index_stale = 0;
+    // The old derivation run for a draw inside a program (performance mode:
+    // misses only), by step.
+    uint64_t derived_analysis = 0, derived_primitives = 0, derived_translation = 0,
+             derived_pipeline = 0, derived_viewport = 0;
+    uint64_t shadow_compared = 0, shadow_mismatches = 0, shadow_index_mismatches = 0;
+    uint64_t versions_made = 0, version_bytes = 0, versions_retired = 0, versions_freed = 0,
+             arena_full = 0;
+    uint64_t retire_submissions = 0;
+    double retire_ms = 0.0, retire_ms_max = 0.0;
+    // With gpu_draw_cost_model, by mode (an in-run A/B toggles it).
+    // By mode: the timed draws, and the program lookups at list entry.
+    uint64_t issue_ns[5] = {}, issue_draws[5] = {}, begin_ns[5] = {};
+    uint32_t logs = 0;
+  } draw_program_stats_;
+  enum DrawProgramMiss : uint32_t {
+    kMissNew,         // no draw recorded at this index
+    kMissState,       // state hash or shaders differ
+    kMissDraw,        // draw words differ
+    kMissSettings,    // resolution scale, HUD or object slot differ
+    kMissIndex,       // the index version was retired
+    kMissTargets,     // the render pass differs
+  };
+  // What a drawn draw derived, for DrawProgramRecord.
+  struct ProgramDrawOutputs {
+    uint64_t memo_state;
+    xenos::PrimitiveType prim_type;
+    uint32_t index_count;
+    bool major_mode_explicit;
+    bool indexed;
+    VulkanShader* vertex_shader;
+    VulkanShader* pixel_shader;
+    bool primitive_polygonal;
+    bool is_rasterization_done;
+    reg::RB_DEPTHCONTROL depth_control;
+    uint32_t color_mask;
+    const PrimitiveProcessor::ProcessingResult* primitive;
+    SpirvShaderTranslator::Modification vertex_modification;
+    SpirvShaderTranslator::Modification pixel_modification;
+    VulkanShader::VulkanTranslation* vertex_translation;
+    VulkanShader::VulkanTranslation* pixel_translation;
+    uint32_t render_pass_key;
+    void* pipeline_handle;
+    const draw_util::ViewportInfo* viewport;
+    uint32_t resolution_scale;
+    double hud_squeeze;
+    double hud_scale;
+    bool object_slot;
+    bool indices_owned;
+    uint32_t index_version;
+  };
+  // Records the draw into its program slot, or in shadow mode (compare)
+  // compares it with the recorded one first and counts what differs.
+  void DrawProgramRecord(ProgramDraw& draw, bool recordable, bool compare,
+                         const ProgramDrawOutputs& outputs);
+  bool SupportsDrawPrograms() const override { return true; }
+  void DrawProgramBegin(uint64_t key) override;
+  void DrawProgramResolve();
+  void DrawProgramEnd() override;
+  void DrawProgramFrame();
+  bool EnsureIndexArena();
+  // The live version of [guest_base, + bytes), made (watch, request, copy)
+  // if there is none; UINT32_MAX if it cannot be made.
+  uint32_t AcquireIndexVersion(uint32_t guest_base, uint32_t bytes);
+  void RetireIndexVersion(uint32_t version);
+  void FreeRetiredIndexVersions();
+  static void IndexVersionWritten(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                  void* context, void* data, uint64_t argument,
+                                  bool invalidated_by_gpu);
   // Pixel texture sets are pushed rather than allocated and written when the
   // device has VK_KHR_push_descriptor and the set has at most
   // kMaxPushedTextureBindings bindings (the minimum maxPushDescriptors).
@@ -1385,6 +1740,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
+#if defined(REXGPU_FH1_ORDERED_CENSUS)
+  uint64_t ordered_census_pass_ = 0;
+#endif
 
   // Currently bound graphics pipeline, either from the pipeline cache (with
   // potentially deferred creation - current_external_graphics_pipeline_ is

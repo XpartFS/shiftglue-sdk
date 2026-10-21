@@ -1,3 +1,5 @@
+#include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -12,6 +14,7 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -29,6 +32,7 @@
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/stream.h>
+#include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
@@ -38,6 +42,15 @@
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"});
+REXCVAR_DEFINE_BOOL(swap_post_effect_scene_only, true, "GPU",
+                    "Vulkan: apply the swap post effect to the scene only, not to the HUD drawn "
+                    "over it (no effect where the frame has no scene)");
+REXCVAR_DEFINE_STRING(scene_lut_path, "", "GPU",
+                      "Vulkan: a .cube 3D colour LUT applied to the scene, not the HUD; empty "
+                      "for none");
+REXCVAR_DEFINE_INT32(scene_lut_strength, 100, "GPU",
+                     "Vulkan: how much of the scene LUT applies, in percent")
+    .range(0, 100);
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
@@ -46,6 +59,9 @@ REXCVAR_DEFINE_UINT32(
     pinyon_shift_fh1_render_fps_limit, 0, "Pinyon Shift",
     "FH1 source-render FPS limit (0 follows the host display)")
     .range(0, 240);
+REXCVAR_DEFINE_BOOL(gpu_log_register_reads, false, "GPU",
+                    "Log the first guest read of each GPU register (a census of what the "
+                    "title polls, for deciding which reads need emulation)");
 REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_vblank_deadline_wait, true, "Pinyon Shift",
                     "Deliver FH1 guest vblanks from deadlines instead of 1 ms polling")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -201,6 +217,18 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+        if (cs_scheduler::Enabled()) {
+          cs_scheduler::Actor scheduled(cs_scheduler::kVblank);
+          const uint64_t period = 1000000000 / uint64_t(Fh1GuestVblankHzForRenderLimit(
+              REXCVAR_GET(pinyon_shift_fh1_render_fps_limit), REXCVAR_GET(video_mode_refresh_rate)));
+          uint64_t next = cs_scheduler::Now() + period;
+          while (vsync_worker_running_) {
+            while (cs_scheduler::Now() >= next) { MarkVblank(); next += period; }
+            cs_scheduler::Point(0, cs_scheduler::PointKind::kWait, true, next - cs_scheduler::Now());
+          }
+          return 0;
+        }
+        if (session_probe::Enabled()) session_probe::SetHostRole(2);
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
@@ -323,11 +351,13 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_respons
   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
     return;
   }
-  rex::FatalError("Graphics device lost (probably due to an internal error)");
+  system::ReportHostGpuLoss();
 }
 
 uint32_t GraphicsSystem::ReadRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr) {
-  return gs->ReadRegister(addr);
+  const auto value = gs->ReadRegister(addr);
+  return session_probe::Enabled() ? uint32_t(session_probe::Scalar(
+      session_probe::Kind::kMmioRead, addr, value, true)) : value;
 }
 
 void GraphicsSystem::WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr,
@@ -337,6 +367,14 @@ void GraphicsSystem::WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, u
 
 uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
   uint32_t r = (addr & 0xFFFF) / 4;
+
+  if (REXCVAR_GET(gpu_log_register_reads)) {
+    static std::atomic<bool> seen[RegisterFile::kRegisterCount];
+    if (r < RegisterFile::kRegisterCount && !seen[r].exchange(true)) {
+      const auto* info = register_file_.GetRegisterInfo(r);
+      REXGPU_INFO("GPU: register.first_read {:04X} {}", r, info ? info->name : "?");
+    }
+  }
 
   switch (r) {
     case 0x0F00:  // RB_EDRAM_TIMING
@@ -397,11 +435,29 @@ void GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_siz
 void GraphicsSystem::SetInterruptCallback(uint32_t callback, uint32_t user_data) {
   interrupt_callback_ = callback;
   interrupt_callback_data_ = user_data;
+  if (session_probe::Enabled()) {
+    session_probe::Scalar(session_probe::Kind::kCallbackRegistration, callback, user_data);
+    session_interrupt_callback_.store((uint64_t(callback) << 32) | user_data,
+                                      std::memory_order_release);
+  }
   REXGPU_INFO("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
 }
 
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
-  if (!interrupt_callback_) {
+  uint32_t callback = interrupt_callback_, callback_data = interrupt_callback_data_;
+  if (session_probe::Enabled()) {
+    const auto expected = session_probe::Scalar(session_probe::Kind::kInterruptDelivery,
+        (uint64_t(source) << 32) | cpu,
+        session_interrupt_callback_.load(std::memory_order_acquire), true);
+    callback = uint32_t(expected >> 32); callback_data = uint32_t(expected);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (expected && session_interrupt_callback_.load(std::memory_order_acquire) != expected) {
+      session_probe::Require(std::chrono::steady_clock::now() < deadline,
+          "capture incomplete: interrupt callback publication was not reached");
+      std::this_thread::yield();
+    }
+  }
+  if (!callback) {
     return;
   }
 
@@ -417,12 +473,13 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   // REXGPU_INFO("Dispatching GPU interrupt at {:08X} w/ mode {} on cpu {}",
   //          interrupt_callback_, source, cpu);
 
-  uint64_t args[] = {source, interrupt_callback_data_};
-  function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
+  uint64_t args[] = {source, callback_data};
+  function_dispatcher_->ExecuteInterrupt(thread->thread_state(), callback, args,
                                          rex::countof(args));
 }
 
 void GraphicsSystem::MarkVblank() {
+  if (session_probe::Enabled()) session_probe::Delivery(session_probe::Kind::kVblankDelivery, 0, 0);
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
 
@@ -469,6 +526,14 @@ void GraphicsSystem::InvalidateGpuMemory() {
 
 uint32_t GraphicsSystem::draw_resolution_scale() const {
   return command_processor_ ? command_processor_->draw_resolution_scale() : 0;
+}
+
+std::shared_ptr<Fh1FrameInspector> GraphicsSystem::frame_inspector() const {
+  return command_processor_ ? command_processor_->frame_inspector() : nullptr;
+}
+
+bool GraphicsSystem::OpenInspectionDump(const std::filesystem::path& path, Fh1InspectionView view) {
+  return command_processor_ && command_processor_->OpenInspectionDump(path, view);
 }
 
 bool GraphicsSystem::fh1_shadow_mask(uint32_t* base, uint32_t* length,

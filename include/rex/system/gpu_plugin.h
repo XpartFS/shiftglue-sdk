@@ -29,7 +29,7 @@
 namespace rex::system {
 
 // Bump on any change to GpuCreateInfo or to the IGraphicsSystem interface.
-inline constexpr uint32_t kGpuPluginAbiVersion = 2;
+inline constexpr uint32_t kGpuPluginAbiVersion = 3;
 
 inline constexpr const char* kGpuCreateSymbol = "rex_gpu_create";
 inline constexpr const char* kGpuAbiVersionSymbol = "rex_gpu_abi_version";
@@ -52,5 +52,14 @@ using GpuCreateFn = IGraphicsSystem* (*)(uint32_t abi_version, const GpuCreateIn
 // handle is retained for process lifetime; plugins are never unloaded.
 std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name,
                                                std::string_view backend = "any");
+
+/// Called once when the host GPU device is lost (a driver reset or a GPU
+/// timeout), from any thread, before the process stops. A host sets it to
+/// explain the stop to the player; the handler should not return. Lives in
+/// the runtime so the GPU plugin and the presenter share it.
+using HostGpuLossHandler = void (*)();
+void SetHostGpuLossHandler(HostGpuLossHandler handler);
+/// Runs the host's handler, then stops with a fatal error.
+[[noreturn]] void ReportHostGpuLoss();
 
 }  // namespace rex::system

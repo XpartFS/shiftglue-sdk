@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -25,6 +26,7 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/upscaler.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_diagnostic_checkpoints, false, "UI/Vulkan",
                     "Diagnostics: on NVIDIA, mark draws, copies, texture loads and executor "
@@ -35,6 +37,10 @@ REXCVAR_DEFINE_BOOL(vulkan_pipeline_statistics, false, "UI/Vulkan",
                     "Diagnostics: log the driver's statistics (instructions, registers, "
                     "spills) for every graphics pipeline, where the driver reports them "
                     "through VK_KHR_pipeline_executable_properties")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_fragment_shading_rate, REX_PLATFORM_LINUX, "UI/Vulkan",
+                    "Enable VK_KHR_fragment_shading_rate where the device has it, so chosen "
+                    "passes may be shaded once per 2x2 pixels (fh1_coarse_shading)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
@@ -63,6 +69,10 @@ REXCVAR_DEFINE_BOOL(vulkan_debug_object_names, !REX_PLATFORM_ANDROID, "UI/Vulkan
                     "Android: the emulator's Mesa-based driver crashes naming objects its "
                     "gfxstream layer does not back with Mesa objects")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(vulkan_max_api_version_minor, 0, "UI/Vulkan",
+                     "Diagnostics: treat the device as Vulkan 1.<n> at most (1 or 2; 0 = no cap), "
+                     "so the 1.1 and 1.2 setup paths can be tested on a newer driver (#618)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_capability_report, REX_PLATFORM_ANDROID, "UI/Vulkan",
                     "Log one VULKAN_CAPABILITY_REPORT line per device: the features, "
                     "extensions, limits, memory heaps and render-target formats the renderer "
@@ -286,6 +296,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   ifn.vkGetPhysicalDeviceProperties(physical_device, &properties);
 
   const uint32_t unclamped_api_version = properties.apiVersion;
+  if (const int32_t max_minor = REXCVAR_GET(vulkan_max_api_version_minor);
+      max_minor > 0 && VK_API_VERSION_MINOR(properties.apiVersion) > uint32_t(max_minor)) {
+    properties.apiVersion = VK_MAKE_API_VERSION(0, 1, uint32_t(max_minor), 0);
+  }
   if (vulkan_instance->api_version() < VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     // From the VkApplicationInfo specification:
     //
@@ -425,6 +439,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_present_id)
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_present_wait)
     }
+    // #106, for HDR10 output (present_hdr).
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_hdr_metadata)
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
@@ -472,12 +488,28 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       // #237.
       XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_spirv_1_4, 1, 2)
     }
+    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0) &&
+        REXCVAR_GET(vulkan_fragment_shading_rate)) {
+      // #227, for coarse shading of chosen passes (needs
+      // VK_KHR_create_renderpass2, core in 1.2).
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_fragment_shading_rate)
+    }
   }
 
 #undef XE_UI_VULKAN_STRUCT_EXTENSION
 #undef XE_UI_VULKAN_LOCAL_EXTENSION
 #undef XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION
 #undef XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION
+
+  // Upscaler providers' extensions (DLSS's NGX on NVIDIA), enabled when
+  // supported.
+  std::deque<bool> upscaler_extensions_enabled;
+  for (const char* name : GetVulkanUpscalerDeviceExtensions(vulkan_instance->instance(),
+                                                            physical_device,
+                                                            properties.vendorID)) {
+    upscaler_extensions_enabled.push_back(false);
+    requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
+  }
 
   std::vector<const char*> enabled_extensions;
   {
@@ -579,6 +611,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR>
       features_KHR_pipeline_executable_properties;
+  VulkanFeatures<VkPhysicalDeviceFragmentShadingRateFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR>
+      features_KHR_fragment_shading_rate;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -639,6 +674,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_KHR_pipeline_executable_properties) {
       features_KHR_pipeline_executable_properties.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_fragment_shading_rate) {
+      features_KHR_fragment_shading_rate.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -858,6 +896,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_LIMIT(maxImageDimension3D)
   XE_UI_VULKAN_LIMIT(maxImageDimensionCube)
   XE_UI_VULKAN_LIMIT(maxImageArrayLayers)
+  XE_UI_VULKAN_LIMIT(maxTexelBufferElements)
   XE_UI_VULKAN_LIMIT(maxStorageBufferRange)
   XE_UI_VULKAN_LIMIT(maxSamplerAllocationCount)
   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorSamplers)
@@ -915,6 +954,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+      if (rex::cvar::Query<bool>("gpu_async_fence_probe")) {
+        XE_UI_VULKAN_FEATURE_2(features_1_2, timelineSemaphore);
+      }
+#endif
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, runtimeDescriptorArray);
@@ -1021,6 +1065,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_KHR_pipeline_executable_properties) {
     XE_UI_VULKAN_FEATURE_2(features_KHR_pipeline_executable_properties, pipelineExecutableInfo)
   }
+  if (device->extensions_.ext_KHR_fragment_shading_rate) {
+    XE_UI_VULKAN_FEATURE_2(features_KHR_fragment_shading_rate, pipelineFragmentShadingRate)
+  }
 
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
@@ -1101,6 +1148,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_present_wait) {
 #include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
+  }
+  if (device->extensions_.ext_EXT_hdr_metadata) {
+#include <rex/ui/vulkan/functions/device_ext_hdr_metadata.inc>
+  }
+  if (device->extensions_.ext_KHR_fragment_shading_rate) {
+#include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

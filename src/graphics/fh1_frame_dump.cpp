@@ -1,9 +1,11 @@
+#include <rex/filesystem.h>
 #include <rex/graphics/fh1_frame_dump.h>
 
 #include <algorithm>
 #include <bit>
 #include <cstring>
 #include <fstream>
+#include <limits>
 
 #include <rex/types.h>
 #include <rex/cvar.h>
@@ -14,8 +16,9 @@
 #include <rex/logging.h>
 
 REXCVAR_DEFINE_INT32(fh1_frame_dump_frame, 0, "GPU",
-                     "Record this FH1 frame (executor swap number) for offline replay")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                     "One-shot FH1 frame dump (executor swap number); negative records the "
+                     "next complete frame. The request resets to zero when armed")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(fh1_frame_dump_path, "", "GPU",
                       "File the recorded FH1 frame dump is written to")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -73,7 +76,10 @@ Fh1FrameDump::~Fh1FrameDump() {
 }
 
 uint64_t Fh1FrameDump::RequestedFrame() {
-  return uint64_t(std::max(REXCVAR_GET(fh1_frame_dump_frame), 0));
+  const int32_t requested = REXCVAR_GET(fh1_frame_dump_frame);
+  if (!requested) return 0;
+  REXCVAR_SET(fh1_frame_dump_frame, 0);
+  return requested < 0 ? std::numeric_limits<uint64_t>::max() : uint64_t(requested);
 }
 
 std::filesystem::path Fh1FrameDump::RequestedPath() {
@@ -82,6 +88,14 @@ std::filesystem::path Fh1FrameDump::RequestedPath() {
 
 void Fh1FrameDump::OnSwap(uint64_t frame, uint32_t frontbuffer_address) {
   if (done_) return;
+  if (frame_ == std::numeric_limits<uint64_t>::max()) frame_ = frame + 1;
+  // A request for the current or a past frame (fh1_frame_dump_frame is hot
+  // reloaded) records the next one instead of waiting forever and blocking
+  // every later request.
+  if (!recording_ && frame + 1 > frame_) {
+    REXGPU_WARN("FH1 frame dump: frame {} has passed; recording frame {}", frame_, frame + 1);
+    frame_ = frame + 1;
+  }
   if (!recording_ && frame + 1 == frame_) {
     Begin();
   } else if (recording_ && frame == frame_) {
@@ -270,8 +284,8 @@ void Fh1FrameDump::End(uint32_t frontbuffer_address) {
   REXGPU_INFO(
       "FH1 frame dump: frame {} written to {} ({} packet dwords, {} blocks, {} MB, front buffer "
       "{:08X}+{})",
-      frame_, path_.string(), packets_.size(), block_count, block_bytes >> 20, front.address,
-      front.length);
+      frame_, rex::path_to_utf8(path_), packets_.size(), block_count, block_bytes >> 20,
+      front.address, front.length);
   packets_.clear();
   blocks_.clear();
 }

@@ -24,21 +24,35 @@
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
+#include <rex/session_probe.h>
 #include <rex/ui/keybinds.h>
 
 REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_BOOL(input_report_wheel_subtype, false, "Input",
+                    "Report a detected wheel to the title as XINPUT_DEVSUBTYPE_WHEEL instead of "
+                    "a gamepad, so the title can pick its wheel handling (untested in FH1: the "
+                    "title's wheel path is still being traced)");
 REXCVAR_DEFINE_STRING(pad_chord_debug_overlay, "LS+RS", "Input",
                       "Controller buttons held together that toggle the debug overlay (F3), "
                       "names as in pad_remap joined by '+'; empty turns the chord off. The "
                       "title does not see them while the chord is held")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(pad_chord_game_menu, "BACK+START", "Input",
+                      "Controller buttons held together that open the game's settings menu "
+                      "(bind_game_menu, F6), so a controller-only player (Steam Deck, handhelds) "
+                      "reaches it; names as in pad_remap joined by '+'; empty turns it off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(pad_rumble_strength, 100, "Input",
                      "Controller rumble strength in percent of what the title asks for (0 turns "
                      "it off)")
     .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(pad_log_vibration, false, "Input",
+                    "Log every change of the title's two rumble motor values (the motor census "
+                    "for DualSense trigger effects)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 namespace rex::input {
 
@@ -49,17 +63,27 @@ namespace {
 // flag and never reads this value.
 constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
 
+constexpr auto kTelemetryLifetime = std::chrono::milliseconds(250);
+
+std::atomic<InputSystem*> g_live_input_system{nullptr};
+
 }  // namespace
 
-InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
+InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {
+  g_live_input_system = this;
+}
 
-InputSystem::~InputSystem() = default;
+InputSystem::~InputSystem() {
+  InputSystem* self = this;
+  g_live_input_system.compare_exchange_strong(self, nullptr);
+}
 
 X_STATUS InputSystem::Setup() {
   return X_STATUS_SUCCESS;
 }
 
 void InputSystem::Shutdown() {
+  ReleaseFeedback(false);
   // device_owners_ holds raw driver pointers.
   devices_.clear();
   device_owners_.clear();
@@ -78,6 +102,7 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
 }
 
 void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+  active_callback_ = callback;
   for (auto& driver : drivers_) {
     driver->set_is_active_callback(callback);
   }
@@ -196,7 +221,7 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
   return nullptr;
 }
 
-X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+X_RESULT InputSystem::GetCapabilitiesImpl(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
   if (!out_caps || !assignment_) {
@@ -225,8 +250,37 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
 }
 
+namespace {
+template <typename T, typename Read>
+X_RESULT SessionInput(session_probe::Kind result_kind, session_probe::Kind data_kind,
+                       uint64_t key, T* output, Read read) {
+  if (!session_probe::ExternalEnabled()) return read();
+  X_RESULT result = X_ERROR_SUCCESS;
+  if (!session_probe::Replaying()) {
+    session_probe::Suppress native_input_clock;
+    result = read();
+  }
+  result = X_RESULT(session_probe::Scalar(result_kind, key, result, true));
+  if (result == X_ERROR_SUCCESS)
+    session_probe::Blob(data_kind, key, output, sizeof(*output));
+  return result;
+}
+}
+X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+  return SessionInput(session_probe::Kind::kInputCapsResult, session_probe::Kind::kInputCapsData,
+                      (uint64_t(user_index) << 32) | flags, out_caps,
+                      [&] { return GetCapabilitiesImpl(user_index, flags, out_caps); });
+}
+X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                   X_INPUT_KEYSTROKE* out_keystroke) {
+  return SessionInput(session_probe::Kind::kInputKeyResult, session_probe::Kind::kInputKeyData,
+                      (uint64_t(user_index) << 32) | flags, out_keystroke,
+                      [&] { return GetKeystrokeImpl(user_index, flags, out_keystroke); });
+}
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
-  return GetMergedState(user_index, false, out_state);
+  return SessionInput(session_probe::Kind::kInputResult, session_probe::Kind::kInputState,
+                      user_index, out_state, [&] { return GetMergedState(user_index, false, out_state); });
 }
 
 X_RESULT InputSystem::GetHostPadState(uint32_t user_index, X_INPUT_STATE* out_state) {
@@ -244,6 +298,7 @@ struct PadChord {
   bool held[4] = {};
 };
 PadChord g_pad_chord_debug_overlay = {"bind_debug_overlay"};
+PadChord g_pad_chord_game_menu = {"bind_game_menu"};
 
 void ApplyPadChord(PadChord& chord, const std::string& text, uint32_t user_index,
                    X_INPUT_GAMEPAD& pad) {
@@ -292,6 +347,8 @@ X_RESULT InputSystem::GetMergedState(uint32_t user_index, bool host_pads_only,
     if (!host_pads_only && !driver->is_keyboard_and_mouse()) {
       ApplyPadChord(g_pad_chord_debug_overlay, REXCVAR_GET(pad_chord_debug_overlay), user_index,
                     state.gamepad);
+      ApplyPadChord(g_pad_chord_game_menu, REXCVAR_GET(pad_chord_game_menu), user_index,
+                    state.gamepad);
       ApplyPadRemap(state.gamepad);
     }
     if (!any) {
@@ -305,11 +362,168 @@ X_RESULT InputSystem::GetMergedState(uint32_t user_index, bool host_pads_only,
   if (!any) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
+  if (!host_pads_only) {
+    UpdateFeedbackLocked(user_index, ids, merged);
+  }
   if (out_state) {
     *out_state = merged;
   }
   return X_ERROR_SUCCESS;
 }
+
+void InputSystem::UpdateFeedbackLocked(uint32_t user_index, const std::vector<DeviceId>& ids,
+                                       const X_INPUT_STATE& guest_state) {
+  if (user_index >= kMaxGuestUsers) {
+    return;
+  }
+  bool any_triggers = false;
+  bool any_lightbar = false;
+  for (DeviceId id : ids) {
+    if (const DeviceInfo* info = DeviceInfoFor(id)) {
+      any_triggers |= info->adaptive_triggers;
+      any_lightbar |= info->lightbar;
+    }
+  }
+  if (!any_triggers && !any_lightbar) {
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  auto& last_tick = last_feedback_tick_[user_index];
+  const double dt =
+      last_tick.time_since_epoch().count() == 0
+          ? 0.0
+          : std::chrono::duration<double>(now - last_tick).count();
+  last_tick = now;
+
+  dualsense::CarTelemetry telemetry;
+  bool have_telemetry = false;
+  if (user_index == 0) {
+    std::lock_guard<std::mutex> lock(telemetry_mutex_);
+    if (telemetry_.valid && now - telemetry_time_ < kTelemetryLifetime) {
+      telemetry = telemetry_;
+      have_telemetry = true;
+    }
+  }
+
+  const bool active = !active_callback_ || active_callback_();
+  dualsense::TriggerInputs inputs;
+  inputs.brake = float(uint8_t(guest_state.gamepad.left_trigger)) / 255.0f;
+  inputs.throttle = float(uint8_t(guest_state.gamepad.right_trigger)) / 255.0f;
+  const X_INPUT_VIBRATION& vibration = last_vibration_[user_index];
+  inputs.motor_low = float(uint16_t(vibration.left_motor_speed)) / 65535.0f;
+  inputs.motor_high = float(uint16_t(vibration.right_motor_speed)) / 65535.0f;
+  inputs.driving = active && feedback_driving_.load(std::memory_order_relaxed);
+  inputs.telemetry = have_telemetry ? &telemetry : nullptr;
+
+  // The model speaks of the title's brake and throttle; send each effect to
+  // the physical trigger that drives that control through pad_remap.
+  const dualsense::TriggerEffects game =
+      trigger_models_[user_index].Step(inputs, dualsense::CurrentTriggerSettings(), dt);
+  const PadRemap remap = CurrentPadRemap();
+  const auto for_physical = [&](PadControl physical) {
+    switch (remap[size_t(physical)]) {
+      case PadControl::kLeftTrigger:
+        return game.left;
+      case PadControl::kRightTrigger:
+        return game.right;
+      default:
+        return dualsense::Off();
+    }
+  };
+  dualsense::TriggerEffects physical;
+  physical.left = for_physical(PadControl::kLeftTrigger);
+  physical.right = for_physical(PadControl::kRightTrigger);
+
+  std::optional<dualsense::Rgb> colour;
+  switch (dualsense::CurrentLightbarMode()) {
+    case dualsense::LightbarMode::kOff:
+      colour = dualsense::Rgb{};
+      break;
+    case dualsense::LightbarMode::kRpm:
+      if (have_telemetry && telemetry.redline_rpm > 0.0f) {
+        const bool blink_on =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() /
+                    125 % 2 ==
+            0;
+        colour = dualsense::RpmColour(telemetry.rpm, telemetry.redline_rpm, blink_on);
+      }
+      break;
+    case dualsense::LightbarMode::kPlayer:
+      break;
+  }
+
+  for (DeviceId id : ids) {
+    const DeviceInfo* info = DeviceInfoFor(id);
+    InputDriver* driver = DriverForDevice(id);
+    if (!info || !driver || info->synthetic) {
+      continue;
+    }
+    if (info->adaptive_triggers) {
+      driver->SetDeviceTriggerEffects(id, physical);
+    }
+    if (info->lightbar) {
+      driver->SetDeviceLightbar(id, colour ? &*colour : nullptr);
+    }
+  }
+}
+
+std::vector<DeviceInfo> InputSystem::Devices() {
+  std::lock_guard<std::mutex> lock(devices_mutex_);
+  RefreshDevices();
+  return devices_;
+}
+
+std::optional<DeviceInfo> InputSystem::ActiveDevice(uint32_t user_index) {
+  if (!assignment_) {
+    return std::nullopt;
+  }
+  std::lock_guard<std::mutex> lock(devices_mutex_);
+  RefreshDevices();
+  std::vector<DeviceId> ids;
+  assignment_->DevicesForUser(user_index, ids);
+  if (ids.empty()) {
+    return std::nullopt;
+  }
+  DeviceId chosen = active_devices_.Active(user_index);
+  if (std::find(ids.begin(), ids.end(), chosen) == ids.end()) {
+    // Prefer a physical pad over keyboard emulation when nothing moved yet.
+    chosen = ids.front();
+    for (DeviceId id : ids) {
+      const DeviceInfo* info = DeviceInfoFor(id);
+      if (info && !info->synthetic) {
+        chosen = id;
+        break;
+      }
+    }
+  }
+  const DeviceInfo* info = DeviceInfoFor(chosen);
+  return info ? std::optional<DeviceInfo>(*info) : std::nullopt;
+}
+
+void InputSystem::SetCarTelemetry(const dualsense::CarTelemetry& telemetry) {
+  std::lock_guard<std::mutex> lock(telemetry_mutex_);
+  telemetry_ = telemetry;
+  telemetry_time_ = std::chrono::steady_clock::now();
+}
+
+void InputSystem::SetFeedbackDriving(bool driving) {
+  feedback_driving_.store(driving, std::memory_order_relaxed);
+}
+
+void InputSystem::ReleaseFeedback(bool crashing) {
+  for (auto& driver : drivers_) {
+    driver->ReleaseFeedback(crashing);
+  }
+}
+
+void InputSystem::ReleaseAllFeedback(bool crashing) {
+  if (InputSystem* system = g_live_input_system.load()) {
+    system->ReleaseFeedback(crashing);
+  }
+}
+
+InputSystem* InputSystem::Live() { return g_live_input_system.load(); }
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
@@ -330,6 +544,16 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   bool pad_rumbled = false;
   X_RESULT pad_error = X_ERROR_DEVICE_NOT_CONNECTED;
   X_INPUT_VIBRATION scaled;
+  if (vibration && user_index < kMaxGuestUsers) {
+    X_INPUT_VIBRATION& last = last_vibration_[user_index];
+    if (REXCVAR_GET(pad_log_vibration) &&
+        (uint16_t(last.left_motor_speed) != uint16_t(vibration->left_motor_speed) ||
+         uint16_t(last.right_motor_speed) != uint16_t(vibration->right_motor_speed))) {
+      REXLOG_INFO("Vibration user {}: left {} right {}", user_index,
+                  uint16_t(vibration->left_motor_speed), uint16_t(vibration->right_motor_speed));
+    }
+    last = *vibration;
+  }
   if (vibration) {
     const int32_t strength = std::clamp(REXCVAR_GET(pad_rumble_strength), 0, 100);
     scaled = *vibration;
@@ -363,7 +587,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
   return any_synthetic ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
-X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+X_RESULT InputSystem::GetKeystrokeImpl(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {

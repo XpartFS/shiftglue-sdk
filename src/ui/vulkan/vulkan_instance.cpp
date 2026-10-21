@@ -9,16 +9,19 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <deque>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <rex/filesystem.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
+#include <rex/ui/vulkan/upscaler.h>
 #include <rex/ui/vulkan/presenter.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_validation_sync, false, "UI/Vulkan",
@@ -69,10 +72,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     if (candidate.empty()) {
       continue;
     }
-    attempted_loader_paths.push_back(candidate.string());
+    attempted_loader_paths.push_back(rex::path_to_utf8(candidate));
     if (vulkan_instance->loader_.Load(candidate)) {
       loader_loaded = true;
-      REXLOG_INFO("Loaded Vulkan runtime from {}", candidate.string());
+      REXLOG_INFO("Loaded Vulkan runtime from {}", rex::path_to_utf8(candidate));
       break;
     }
   }
@@ -159,6 +162,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   if (with_surface) {
     // #1.
     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
+    // #105, for the HDR swapchain color spaces (present_hdr).
+    requested_extensions.emplace("VK_EXT_swapchain_colorspace",
+                                 &vulkan_instance->extensions_.ext_EXT_swapchain_colorspace);
 #ifdef VK_USE_PLATFORM_XCB_KHR
     // #6.
     requested_extensions.emplace("VK_KHR_xcb_surface",
@@ -184,6 +190,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     requested_extensions.emplace("VK_EXT_metal_surface",
                                  &vulkan_instance->extensions_.ext_EXT_metal_surface);
 #endif
+  }
+
+  // Upscaler providers' extensions (DLSS's NGX), enabled when supported.
+  std::deque<bool> upscaler_extensions_enabled;
+  for (const char* name : GetVulkanUpscalerInstanceExtensions()) {
+    upscaler_extensions_enabled.push_back(false);
+    requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
   }
 
   std::vector<const char*> enabled_extensions;

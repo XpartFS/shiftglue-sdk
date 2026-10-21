@@ -13,9 +13,12 @@
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/graphics/vulkan/shader_override_files.h>
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -25,16 +28,37 @@
 #include <rex/ui/vulkan/util.h>
 
 
+REXCVAR_DEFINE_STRING(vulkan_shader_discovery_dir, "", "GPU/Vulkan",
+                      "Local output directory for one frame's translated shaders and draws.jsonl")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(vulkan_shader_discovery_frame, 0, "GPU/Vulkan",
+                     "Swap count to discover shaders on (0 disables discovery)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
                     "Above 1x resolution scale, keep the guest's 2x and 4x MSAA surfaces as "
                     "single-sampled images (Vulkan): every guest sample of a pixel is its one "
                     "host sample. Much less GPU work at 3x and 4x; edges lose their MSAA")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(fh1_surface_rows_on_demand, true, "GPU",
+                    "Size each FH1 surface image to the rows its uses claim and grow it when a "
+                    "claim reaches further, instead of the whole EDRAM addressing period "
+                    "(NEXT_LEVEL_RESEARCH.md NL-3.5)");
 REXCVAR_DEFINE_BOOL(fh1_msaa_2x, false, "GPU",
                     "Store FH1's 4x MSAA surfaces with 2 host samples (its top and bottom "
                     "sample pairs each in one): smoother edges than fh1_msaa_single_sample "
                     "for about half the cost of 4x (Vulkan FH1 native executor)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_specialize_edram_passes, true, "GPU",
+                    "Vulkan FH1 resolves and EDRAM transfers use pipelines specialized for "
+                    "each kind (formats, MSAA, pitches); GPUs otherwise run every kind's code "
+                    "per pixel");
+REXCVAR_DEFINE_BOOL(fh1_async_specialized_passes, true, "GPU",
+                    "With fh1_specialize_edram_passes, build each specialized pipeline on a "
+                    "worker and use the generic one until it is ready, instead of stopping the "
+                    "GPU commands thread for it (tens of milliseconds a pipeline on a cold "
+                    "driver cache)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_msaa_single_sample, true, "GPU",
                     "Keep the guest's 2x and 4x MSAA surfaces as single-sampled images at any "
@@ -51,6 +75,27 @@ REXCVAR_DEFINE_BOOL(fh1_trace_resolve_cpu_accesses, false, "GPU",
                     "reads and writes of it (thread and link register), to find the resolves "
                     "the CPU reads (FH1 native executor, Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_native_stats_frames, 600, "GPU",
+                     "Frames between the FH1 native executor's periodic stats and GPU profile "
+                     "logs (Vulkan); shorter windows separate heavy stretches of play")
+    .range(1, 100000);
+REXCVAR_DEFINE_INT32(fh1_visibility_census, 0, "GPU",
+                     "Diagnostics: every N frames, an occlusion query around each draw, logging "
+                     "by rendering how many draws pass no samples (FH1 native executor, Vulkan); "
+                     "0 off")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_visibility_census_no_depth, false, "GPU",
+                    "Diagnostics: census frames of fh1_visibility_census draw without the depth "
+                    "test, so the draws that pass no samples are the ones off screen")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_visibility_oracle_skip, false, "GPU",
+                    "Diagnostics (renders wrong): with fh1_visibility_census, drop each draw "
+                    "outside census frames that passed no samples at its last census, before "
+                    "its derivation, for the ceiling of culling hidden draws");
+REXCVAR_DEFINE_BOOL(fh1_visibility_oracle_late_only, false, "GPU",
+                    "Diagnostics: fh1_visibility_oracle_skip drops only draws with late depth "
+                    "(the pixel shader kills or writes depth, or alpha decides coverage)");
 REXCVAR_DEFINE_BOOL(fh1_fold_clears, true, "GPU",
                     "Record EDRAM clears inside the next draw rendering on the surface (or as "
                     "its load op) instead of in a rendering of their own: on tiled GPUs each "
@@ -75,13 +120,26 @@ REXCVAR_DEFINE_STRING(fh1_debug_skip_transfers, "", "GPU",
                       "<source>=<destination> descriptions (wrong image if they are needed)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
+REXCVAR_DEFINE_BOOL(fh1_readback_small_float_resolves, true, "GPU",
+                    "Read completed 32_FLOAT resolves of 4 KB or less back to guest RAM for "
+                    "the title's CPU auto exposure")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_resolve_two_textures, true, "GPU",
                     "Resolves write up to two textures over their destination directly (such as "
                     "a depth texture and an 8_8_8_8 one reading the same words), not one")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(fh1_coarse_shading, "", "GPU",
+                      "Draw renderings shaded once per block of pixels where the device has "
+                      "VK_KHR_fragment_shading_rate (vulkan_fragment_shading_rate), as "
+                      "comma-separated rendering=WxH entries, the rendering named as in the GPU "
+                      "profile (such as 0/16/1x/d1+720/16/1x/c0=2x2)");
 REXCVAR_DEFINE_BOOL(fh1_debug_skip_clears, false, "GPU",
                     "Diagnostics: skip every EDRAM clear (wrong image), to bound what clears "
                     "cost")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_dispatches, false, "GPU",
+                    "Diagnostics: keep every resolve's barriers but not its compute dispatch "
+                    "(wrong image), to bound what the resolve shaders cost (Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
@@ -386,8 +444,10 @@ Fh1NativeExecutor::~Fh1NativeExecutor() { Shutdown(); }
 bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   config_ = config;
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
+  async_specialize_ = REXCVAR_GET(fh1_async_specialized_passes);
   scale_ = config_.textures->draw_resolution_scale_x();
   untile_height_ = config_.untile_height;
+  UpdateCoarseShading();
   single_sample_msaa_ = (scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample)) ||
                         REXCVAR_GET(fh1_msaa_single_sample);
   stencil_export_ = REXCVAR_GET(fh1_native_stencil_export) &&
@@ -422,6 +482,17 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
         VK_SUCCESS) {
       gpu_query_pool_ = VK_NULL_HANDLE;
       REXGPU_WARN("FH1 native executor (Vulkan): no timestamp query pool for the GPU profile");
+    }
+  }
+  if (REXCVAR_GET(fh1_visibility_census) > 0) {
+    VkQueryPoolCreateInfo query_pool_info = {};
+    query_pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    query_pool_info.queryType = VK_QUERY_TYPE_OCCLUSION;
+    query_pool_info.queryCount = kVisQueries;
+    if (dfn.vkCreateQueryPool(device, &query_pool_info, nullptr, &vis_query_pool_) !=
+        VK_SUCCESS) {
+      vis_query_pool_ = VK_NULL_HANDLE;
+      REXGPU_WARN("FH1 native executor (Vulkan): no occlusion query pool for the census");
     }
   }
 
@@ -486,6 +557,11 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   }
   tiles_.Reset();
   initialized_ = true;
+#if !defined(__ANDROID__)
+  const auto& properties = command_processor_.GetVulkanDevice()->properties();
+  command_processor_.frame_inspector()->SetCapabilities(
+      {bool(properties.fillModeNonSolid), bool(properties.independentBlend), true});
+#endif
   REXGPU_INFO("FH1 native executor enabled: native (Vulkan)");
   return true;
 }
@@ -497,6 +573,12 @@ void Fh1NativeExecutor::Shutdown() {
                                                   nullptr);
     gpu_query_pool_ = VK_NULL_HANDLE;
   }
+  if (vis_query_pool_ != VK_NULL_HANDLE) {
+    const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+    vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(), vis_query_pool_,
+                                                  nullptr);
+    vis_query_pool_ = VK_NULL_HANDLE;
+  }
   if (initialized_) LogStats(frame_);
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   if (!vulkan_device) return;
@@ -506,10 +588,16 @@ void Fh1NativeExecutor::Shutdown() {
     command_processor_.Fh1AwaitAllQueueOperations();
   }
   initialized_ = false;
+  DestroyInspector();
+  StopSpecializeThread();
+  ReleaseRetiredImages(true);
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
   surfaces_.clear();
+  DestroyHudSnapshot();
+  DestroyCamera();
   for (auto& [key, pipeline] : transfer_pipelines_) dfn.vkDestroyPipeline(device, pipeline, nullptr);
   transfer_pipelines_.clear();
+  specialized_transfer_pipelines_ = 0;
   for (auto& by_words : compute_pipelines_) {
     for (auto& by_kind : by_words) {
       for (VkPipeline& pipeline : by_kind) {
@@ -534,16 +622,25 @@ void Fh1NativeExecutor::Shutdown() {
   transfer_words_size_ = 0;
   for (auto& [buffer, memory] : retired_buffers_) destroy_buffer(buffer, memory);
   retired_buffers_.clear();
-  for (PendingReadback& readback : pending_readbacks_) {
-    destroy_buffer(readback.buffer, readback.memory);
-  }
   pending_readbacks_.clear();
+  destroy_buffer(readback_buffer_, readback_memory_);
+  deferred_readbacks_.clear();
+  destroy_buffer(deferred_readback_buffer_, deferred_readback_memory_);
+  deferred_readback_mapped_ = nullptr;
+  deferred_readback_next_ = 0;
+  readback_mapped_ = nullptr;
+  readback_size_ = 0;
+  readback_used_ = 0;
   for (auto& by_kind : image_pipelines_) {
     for (VkPipeline& pipeline : by_kind) {
       if (pipeline) dfn.vkDestroyPipeline(device, pipeline, nullptr);
       pipeline = VK_NULL_HANDLE;
     }
   }
+  for (auto& [key, pipeline] : specialized_resolve_pipelines_) {
+    if (pipeline) dfn.vkDestroyPipeline(device, pipeline, nullptr);
+  }
+  specialized_resolve_pipelines_.clear();
   for (VkPipelineLayout* layout : {&compute_pipeline_layout_, &transfer_pipeline_layout_,
                                    &words_pipeline_layout_, &image_pipeline_layout_}) {
     if (*layout) dfn.vkDestroyPipelineLayout(device, *layout, nullptr);
@@ -723,18 +820,23 @@ void Fh1NativeExecutor::EndUntiledTiling() {
   untile_bands_.clear();
 }
 
-Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceKey& key) {
+Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceKey& key,
+                                                                 uint32_t rows) {
   const uint32_t packed = key.Pack();
-  if (Surface* existing = FindSurface(packed)) return existing;
-  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
-  const auto& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
+  if (Surface* existing = FindSurface(packed)) {
+    if (rows) EnsureSurfaceRows(*existing, rows);
+    return existing;
+  }
   const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
   Surface surface;
   surface.key = key;
   surface.width = key.pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2);
   surface.height = SurfaceHeight(key.pitch_tiles, key.msaa);
-  surface.image_height = std::max(surface.height, untile_height_);
+  const uint32_t full_rows = std::max(surface.height, untile_height_);
+  surface.image_height =
+      REXCVAR_GET(fh1_surface_rows_on_demand) && rows
+          ? std::min(full_rows, std::max(untile_height_, AlignSurfaceRows(rows)))
+          : full_rows;
   surface.samples = single_sample_msaa_ ? 1u
                     : two_sample_msaa_ && key.msaa == uint32_t(xenos::MsaaSamples::k4X)
                         ? 2u
@@ -753,6 +855,28 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
     Skip("surface_format");
     return nullptr;
   }
+  if (!CreateSurfaceImage(surface)) return nullptr;
+  surface_bytes_ += surface.bytes;
+  Surface& stored = surfaces_.emplace(packed, surface).first->second;
+  // Render targets must be initialized before use; zero is also what the
+  // stencil tracking assumes for a new surface.
+  TransitionForAttachment(stored);
+  BeginSurfaceRendering(stored, false);
+  VkClearAttachment clear = {};
+  clear.aspectMask = AspectMask(stored);
+  VkClearRect clear_rect = {};
+  clear_rect.rect.extent = {stored.width * scale_, stored.image_height * scale_};
+  clear_rect.layerCount = 1;
+  command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear, 1, &clear_rect);
+  Count("surface_created");
+  return &stored;
+}
+
+bool Fh1NativeExecutor::CreateSurfaceImage(Surface& surface) {
+  const SurfaceKey& key = surface.key;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
   VkImageCreateInfo image_info = {};
   image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   image_info.flags = surface.uint_format != VK_FORMAT_UNDEFINED
@@ -765,19 +889,29 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   image_info.arrayLayers = 1;
   image_info.samples = VkSampleCountFlagBits(surface.samples);
   image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  // Transfers: the untile copies, the HUD snapshot, and the copy into a
+  // grown image.
   image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
                      (key.is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                                    : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
-                     (untile_height_ ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                                     : 0);
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  surface.image = VK_NULL_HANDLE;
+  surface.memory = VK_NULL_HANDLE;
+  surface.view = VK_NULL_HANDLE;
+  surface.uint_view = VK_NULL_HANDLE;
+  surface.sampled_view = VK_NULL_HANDLE;
+  surface.stencil_view = VK_NULL_HANDLE;
+  surface.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  surface.stage = 0;
+  surface.access = 0;
+  surface.bytes = 0;
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(vulkan_device, image_info,
                                                         ui::vulkan::util::MemoryPurpose::kDeviceLocal,
                                                         surface.image, surface.memory)) {
     Skip("surface_create");
-    return nullptr;
+    return false;
   }
   auto create_view = [&](VkFormat format, VkImageAspectFlags aspect, VkImageView& view_out) {
     VkImageViewCreateInfo view_info = {};
@@ -798,36 +932,141 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   } else {
     views_created = create_view(surface.format, VK_IMAGE_ASPECT_COLOR_BIT, surface.view);
     if (views_created && surface.uint_format != VK_FORMAT_UNDEFINED) {
-      views_created = create_view(surface.uint_format, VK_IMAGE_ASPECT_COLOR_BIT, surface.uint_view);
+      views_created =
+          create_view(surface.uint_format, VK_IMAGE_ASPECT_COLOR_BIT, surface.uint_view);
     }
     surface.sampled_view = surface.uint_view ? surface.uint_view : surface.view;
   }
   if (!views_created) {
+    // DestroySurface subtracts the surface's bytes, which this one never added.
     DestroySurface(surface);
     Skip("surface_view_create");
-    return nullptr;
+    return false;
   }
   VkMemoryRequirements requirements = {};
   dfn.vkGetImageMemoryRequirements(device, surface.image, &requirements);
   surface.bytes = requirements.size;
-  surface_bytes_ += surface.bytes;
-  Surface& stored = surfaces_.emplace(packed, surface).first->second;
-  // Render targets must be initialized before use; zero is also what the
-  // stencil tracking assumes for a new surface.
-  TransitionForAttachment(stored);
-  BeginSurfaceRendering(stored, false);
+  return true;
+}
+
+uint32_t Fh1NativeExecutor::AlignSurfaceRows(uint32_t rows) {
+  // Whole 128-row steps: few regrowths, little slack.
+  return (rows + 127) & ~uint32_t(127);
+}
+
+uint32_t Fh1NativeExecutor::ClaimRows(const SurfaceKey& key, uint32_t base,
+                                      uint32_t length) const {
+  if (!key.pitch_tiles || !length) return 0;
+  const uint32_t pitch = key.pitch_tiles << uint32_t(key.Is64bpp());
+  const uint32_t offset =
+      (base + xenos::kEdramTileCount - key.base_tiles) % xenos::kEdramTileCount;
+  const uint32_t tile_rows = (offset + length + pitch - 1) / pitch;
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  return tile_rows * (xenos::kEdramTileHeightSamples >> msaa_y_log2);
+}
+
+void Fh1NativeExecutor::EnsureSurfaceRows(Surface& surface, uint32_t rows) {
+  const uint32_t full_rows = std::max(surface.height, untile_height_);
+  rows = std::min(rows, full_rows);
+  if (rows <= surface.image_height) return;
+  // Grow by half again at least, so a surface that keeps reaching further
+  // is copied a few times, not once per tile row.
+  const uint32_t old_rows = surface.image_height;
+  const uint32_t new_rows =
+      std::min(full_rows, AlignSurfaceRows(std::max(rows, old_rows + old_rows / 2)));
+  // Nothing may render into the old image after this point.
+  FlushPendingClears(surface);
+  command_processor_.EndRenderPass();
+  rendering_id_ = 0;
+  Surface grown = surface;
+  grown.image_height = new_rows;
+  grown.pending_clears.clear();
+  if (!CreateSurfaceImage(grown)) {
+    Skip("surface_grow");
+    return;
+  }
+  // Copy the old rows in; the rows past them are cleared to zero below, as a
+  // created surface is.
+  const VkImageAspectFlags aspect = AspectMask(surface);
+  Transition(grown, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_WRITE_BIT);
+  Transition(surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_READ_BIT);
+  command_processor_.SubmitBarriers(true);
+  auto& commands = command_processor_.deferred_command_buffer();
+  VkImageCopy region = {};
+  region.srcSubresource = {aspect, 0, 0, 1};
+  region.dstSubresource = region.srcSubresource;
+  region.extent = {surface.width * scale_, old_rows * scale_, 1};
+  commands.CmdVkCopyImage(surface.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, grown.image,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+  // The old image lives until the GPU has finished this submission.
+  RetiredImage retired;
+  retired.submission = command_processor_.GetCurrentSubmission();
+  retired.image = surface.image;
+  retired.memory = surface.memory;
+  retired.views[0] = surface.view;
+  retired.views[1] = surface.uint_view;
+  retired.views[2] =
+      surface.sampled_view != surface.view && surface.sampled_view != surface.uint_view
+          ? surface.sampled_view
+          : VK_NULL_HANDLE;
+  retired.views[3] = surface.stencil_view;
+  retired_images_.push_back(retired);
+  surface_bytes_ += grown.bytes;
+  surface_bytes_ -= surface.bytes;
+  surface.image = grown.image;
+  surface.memory = grown.memory;
+  surface.view = grown.view;
+  surface.uint_view = grown.uint_view;
+  surface.sampled_view = grown.sampled_view;
+  surface.stencil_view = grown.stencil_view;
+  surface.image_height = new_rows;
+  surface.bytes = grown.bytes;
+  surface.layout = grown.layout;
+  surface.stage = grown.stage;
+  surface.access = grown.access;
+  TransitionForAttachment(surface);
+  BeginSurfaceRendering(surface, false);
   VkClearAttachment clear = {};
-  clear.aspectMask = AspectMask(stored);
+  clear.aspectMask = aspect;
   VkClearRect clear_rect = {};
-  clear_rect.rect.extent = {stored.width * scale_, stored.image_height * scale_};
+  clear_rect.rect.offset = {0, int32_t(old_rows * scale_)};
+  clear_rect.rect.extent = {surface.width * scale_, (new_rows - old_rows) * scale_};
   clear_rect.layerCount = 1;
-  command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear, 1, &clear_rect);
-  Count("surface_created");
-  return &stored;
+  commands.CmdVkClearAttachments(1, &clear, 1, &clear_rect);
+  Count("surface_grown");
+}
+
+void Fh1NativeExecutor::ReleaseRetiredImages(bool all) {
+  if (retired_images_.empty()) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  size_t kept = 0;
+  for (size_t i = 0; i < retired_images_.size(); ++i) {
+    RetiredImage& retired = retired_images_[i];
+    if (!all && retired.submission > completed) {
+      retired_images_[kept++] = retired;
+      continue;
+    }
+    for (VkImageView view : retired.views) {
+      if (view) dfn.vkDestroyImageView(device, view, nullptr);
+    }
+    if (retired.image) dfn.vkDestroyImage(device, retired.image, nullptr);
+    if (retired.memory) dfn.vkFreeMemory(device, retired.memory, nullptr);
+  }
+  retired_images_.resize(kept);
 }
 
 void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key,
                                    bool transfer) {
+  // The image must hold every row a claim reaches before anything is
+  // transferred or drawn there.
+  if (Surface* surface = FindSurface(packed_key)) {
+    EnsureSurfaceRows(*surface, ClaimRows(surface->key, base, length));
+  }
   const auto runs = tiles_.Claim(base, length, packed_key, transfer);
   if (runs.empty()) return;
   Surface* dest = FindSurface(packed_key);
@@ -870,23 +1109,41 @@ VkShaderModule Fh1NativeExecutor::GetShaderModule(const uint32_t* code, size_t s
 VkPipeline Fh1NativeExecutor::GetTransferPipeline(const TransferPipelineKey& key) {
   auto it = transfer_pipelines_.find(key);
   if (it != transfer_pipelines_.end()) return it->second;
+  VkShaderModule vertex_module, fragment_module;
+  if (!GetTransferModules(key, vertex_module, fragment_module)) return VK_NULL_HANDLE;
+  if (key.specialized) ++specialized_transfer_pipelines_;
+  VkPipeline pipeline = CreateTransferPipeline(key, vertex_module, fragment_module);
+  if (!pipeline) return VK_NULL_HANDLE;
+  return transfer_pipelines_.emplace(key, pipeline).first->second;
+}
+
+uint32_t Fh1NativeExecutor::TransferKind(const TransferPipelineKey& key) {
   // Depth with stencil exported by the shader has the depth pass's state; the
   // exported value takes the place of the stencil reference.
-  const bool exports_stencil = key.dest_kind == kTransferDestDepthStencil;
-  const uint32_t kind = exports_stencil                   ? 1
-                        : key.dest_kind == kTransferDestUint ? 3
-                                                             : std::min(key.dest_kind, 2u);
+  return key.dest_kind == kTransferDestDepthStencil ? 1
+         : key.dest_kind == kTransferDestUint        ? 3
+                                                     : std::min(key.dest_kind, 2u);
+}
+
+bool Fh1NativeExecutor::GetTransferModules(const TransferPipelineKey& key,
+                                           VkShaderModule& vertex_module,
+                                           VkShaderModule& fragment_module) {
+  const uint32_t kind = TransferKind(key);
   const SpirvShader& fragment =
-      exports_stencil
+      key.dest_kind == kTransferDestDepthStencil
           ? kTransferDepthStencilShaders[key.dest_samples > 1][key.source_kind][key.source_msaa]
       : key.source_kind == kTransferSourceWords
           ? kFromWordsShaders[kind == 1 ? 0 : 1][key.dest_samples > 1]
           : kTransferShaders[kind][key.dest_samples > 1][key.source_kind][key.source_msaa];
-  VkShaderModule vertex_module =
-      GetShaderModule(shaders::fullscreen_cw_vs, sizeof(shaders::fullscreen_cw_vs));
-  VkShaderModule fragment_module = GetShaderModule(fragment.code, fragment.size);
-  if (!vertex_module || !fragment_module) return VK_NULL_HANDLE;
+  vertex_module = GetShaderModule(shaders::fullscreen_cw_vs, sizeof(shaders::fullscreen_cw_vs));
+  fragment_module = GetShaderModule(fragment.code, fragment.size);
+  return vertex_module && fragment_module;
+}
 
+VkPipeline Fh1NativeExecutor::CreateTransferPipeline(const TransferPipelineKey& key,
+                                                     VkShaderModule vertex_module,
+                                                     VkShaderModule fragment_module) const {
+  const uint32_t kind = TransferKind(key);
   VkPipelineShaderStageCreateInfo stages[2] = {};
   stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -895,6 +1152,16 @@ VkPipeline Fh1NativeExecutor::GetTransferPipeline(const TransferPipelineKey& key
   stages[1] = stages[0];
   stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
   stages[1].module = fragment_module;
+  // fh1_spec, then the constants fh1_native_transfer.ps.hlsl takes from it.
+  const uint32_t spec_values[4] = {1u, key.spec[0], key.spec[1], key.spec[2]};
+  VkSpecializationMapEntry spec_entries[4];
+  for (uint32_t i = 0; i < 4; ++i) {
+    spec_entries[i] = {i, uint32_t(sizeof(uint32_t)) * i, sizeof(uint32_t)};
+  }
+  const VkSpecializationInfo spec_info = {4, spec_entries, sizeof(spec_values), spec_values};
+  if (key.specialized) {
+    stages[1].pSpecializationInfo = &spec_info;
+  }
   VkPipelineVertexInputStateCreateInfo vertex_input = {};
   vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
   VkPipelineInputAssemblyStateCreateInfo input_assembly = {};
@@ -973,22 +1240,169 @@ VkPipeline Fh1NativeExecutor::GetTransferPipeline(const TransferPipelineKey& key
                                                         : transfer_pipeline_layout_;
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   VkPipeline pipeline;
-  if (vulkan_device->functions().vkCreateGraphicsPipelines(vulkan_device->device(),
-                                                           VK_NULL_HANDLE, 1, &info, nullptr,
-                                                           &pipeline) != VK_SUCCESS) {
+  if (vulkan_device->functions().vkCreateGraphicsPipelines(
+          vulkan_device->device(), command_processor_.UsePersistentVkPipelineCache(), 1, &info,
+          nullptr, &pipeline) != VK_SUCCESS) {
     return VK_NULL_HANDLE;
   }
-  return transfer_pipelines_.emplace(key, pipeline).first->second;
+  return pipeline;
 }
 
 VkPipeline Fh1NativeExecutor::GetComputePipeline(bool words, uint32_t source_kind, bool msaa) {
   VkPipeline& pipeline = compute_pipelines_[words][source_kind][msaa];
   if (pipeline) return pipeline;
   const SpirvShader& shader = kComputeShaders[words][source_kind][msaa];
-  pipeline = ui::vulkan::util::CreateComputePipeline(command_processor_.GetVulkanDevice(),
-                                                     compute_pipeline_layout_, shader.code,
-                                                     shader.size);
+  pipeline = ui::vulkan::util::CreateComputePipeline(
+      command_processor_.GetVulkanDevice(), compute_pipeline_layout_, shader.code, shader.size,
+      nullptr, "main", command_processor_.UsePersistentVkPipelineCache());
   return pipeline;
+}
+
+void Fh1NativeExecutor::SpecializeTransfer(TransferPipelineKey& key,
+                                           const uint32_t* constants) {
+  if (!REXCVAR_GET(fh1_specialize_edram_passes)) return;
+  TransferPipelineKey specialized = key;
+  specialized.specialized = true;
+  specialized.spec = {constants[0] & ~0x7FFu, constants[1] & ~0x7FFu, constants[2]};
+  if (!async_specialize_) {
+    // Like resolves, a few dozen kinds; past the cap, generic.
+    if (specialized_transfer_pipelines_ < 256 || transfer_pipelines_.count(specialized)) {
+      key = specialized;
+    }
+    return;
+  }
+  CollectSpecialized();
+  auto it = transfer_pipelines_.find(specialized);
+  if (it != transfer_pipelines_.end()) {
+    // Null while the worker builds it, or if it failed: generic.
+    if (it->second) key = specialized;
+    return;
+  }
+  if (specialized_transfer_pipelines_ >= 256) return;
+  VkShaderModule vertex_module, fragment_module;
+  if (!GetTransferModules(specialized, vertex_module, fragment_module)) return;
+  ++specialized_transfer_pipelines_;
+  transfer_pipelines_.emplace(specialized, VK_NULL_HANDLE);
+  SpecializeJob job;
+  job.transfer = true;
+  job.transfer_key = specialized;
+  job.create = [this, specialized, vertex_module, fragment_module]() {
+    return CreateTransferPipeline(specialized, vertex_module, fragment_module);
+  };
+  QueueSpecialize(std::move(job));
+}
+
+VkPipeline Fh1NativeExecutor::GetSpecializedResolvePipeline(bool image, uint32_t source_kind,
+                                                           bool msaa,
+                                                           const uint32_t* constants) {
+  if (!REXCVAR_GET(fh1_specialize_edram_passes)) return VK_NULL_HANDLE;
+  // fh1_spec, then the bits fh1_native_resolve_memory.cs.hlsl takes from them.
+  const std::array<uint32_t, 7> values = {
+      1u,
+      constants[2] & ~0x7FFu,
+      constants[3] & ~0x7FFu,
+      constants[4] & 0xFFFFu,
+      (constants[5] & ~0xFF00u) | ((constants[5] & 0xFF00u) ? 0u : 1u << 31),
+      image ? constants[9] : 0u,
+      image ? constants[10] : 0u};
+  const std::array<uint32_t, 9> key = {uint32_t(image), source_kind, uint32_t(msaa),
+                                        values[1], values[2], values[3], values[4],
+                                        values[5], values[6]};
+  if (async_specialize_) CollectSpecialized();
+  auto it = specialized_resolve_pipelines_.find(key);
+  if (it != specialized_resolve_pipelines_.end()) return it->second;
+  // Every kind the title resolves takes a few dozen; past the cap, generic.
+  if (specialized_resolve_pipelines_.size() >= 256) return VK_NULL_HANDLE;
+  const SpirvShader& shader =
+      image ? kImageShaders[source_kind][msaa] : kComputeShaders[false][source_kind][msaa];
+  const VkShaderModule module =
+      shader.code ? GetShaderModule(shader.code, shader.size) : VK_NULL_HANDLE;
+  const VkPipelineLayout layout = image ? image_pipeline_layout_ : compute_pipeline_layout_;
+  auto create = [this, values, module, layout]() -> VkPipeline {
+    if (!module) return VK_NULL_HANDLE;
+    VkSpecializationMapEntry entries[7];
+    for (uint32_t i = 0; i < values.size(); ++i) {
+      entries[i] = {i, uint32_t(sizeof(uint32_t)) * i, sizeof(uint32_t)};
+    }
+    const VkSpecializationInfo info = {uint32_t(values.size()), entries,
+                                       sizeof(uint32_t) * values.size(), values.data()};
+    return ui::vulkan::util::CreateComputePipeline(
+        command_processor_.GetVulkanDevice(), layout, module, &info, "main",
+        command_processor_.UsePersistentVkPipelineCache());
+  };
+  if (async_specialize_ && module) {
+    // Generic until the worker has built it.
+    specialized_resolve_pipelines_.emplace(key, VK_NULL_HANDLE);
+    SpecializeJob job;
+    job.resolve_key = key;
+    job.create = std::move(create);
+    QueueSpecialize(std::move(job));
+    return VK_NULL_HANDLE;
+  }
+  const VkPipeline pipeline = create();
+  specialized_resolve_pipelines_.emplace(key, pipeline);
+  return pipeline;
+}
+
+void Fh1NativeExecutor::QueueSpecialize(SpecializeJob job) {
+  if (!specialize_thread_) {
+    specialize_thread_ = rex::thread::Thread::Create({}, [this]() { SpecializeThread(); });
+    specialize_thread_->set_name("FH1 Pipelines");
+  }
+  {
+    std::lock_guard<std::mutex> lock(specialize_mutex_);
+    specialize_queue_.push_back(std::move(job));
+  }
+  specialize_cond_.notify_one();
+}
+
+void Fh1NativeExecutor::CollectSpecialized() {
+  if (!specialize_has_done_.load(std::memory_order_acquire)) return;
+  std::vector<SpecializeJob> done;
+  {
+    std::lock_guard<std::mutex> lock(specialize_mutex_);
+    done.swap(specialize_done_);
+    specialize_has_done_.store(false, std::memory_order_relaxed);
+  }
+  for (const SpecializeJob& job : done) {
+    if (job.transfer) {
+      transfer_pipelines_[job.transfer_key] = job.pipeline;
+    } else {
+      specialized_resolve_pipelines_[job.resolve_key] = job.pipeline;
+    }
+  }
+}
+
+void Fh1NativeExecutor::SpecializeThread() {
+  std::unique_lock<std::mutex> lock(specialize_mutex_);
+  while (true) {
+    specialize_cond_.wait(lock,
+                          [this] { return specialize_stop_ || !specialize_queue_.empty(); });
+    if (specialize_queue_.empty()) return;
+    SpecializeJob job = std::move(specialize_queue_.front());
+    specialize_queue_.pop_front();
+    lock.unlock();
+    job.pipeline = job.create();
+    job.create = nullptr;
+    lock.lock();
+    specialize_done_.push_back(std::move(job));
+    specialize_has_done_.store(true, std::memory_order_release);
+  }
+}
+
+void Fh1NativeExecutor::StopSpecializeThread() {
+  if (!specialize_thread_) return;
+  {
+    // The worker finishes what is queued, so every pipeline lands in a map
+    // that Shutdown destroys.
+    std::lock_guard<std::mutex> lock(specialize_mutex_);
+    specialize_stop_ = true;
+  }
+  specialize_cond_.notify_all();
+  rex::thread::Wait(specialize_thread_.get(), false);
+  specialize_thread_.reset();
+  specialize_stop_ = false;
+  CollectSpecialized();
 }
 
 VkDescriptorSet Fh1NativeExecutor::AllocateDescriptorSet(VkDescriptorSetLayout layout) {
@@ -1089,6 +1503,10 @@ void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_fir
                  column_end - column_first, packed_key);
     }
     return;
+  }
+  if (Surface* surface = FindSurface(packed_key)) {
+    const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+    EnsureSurfaceRows(*surface, row_end * (xenos::kEdramTileHeightSamples >> msaa_y_log2));
   }
   const uint32_t previous_owner = claim.previous_owner;
   if (previous_owner == kNoOwner) return;
@@ -1245,6 +1663,9 @@ void Fh1NativeExecutor::FlushColorTransfers(Surface& dest, size_t first, size_t 
     key.sample_mask = sample_mask;
     key.source_kind = SourceKind(source->key.is_depth, source->key.format);
     key.source_msaa = source->samples > 1;
+    const uint32_t constants[kTransferConstantCount] = {LayoutConstant(dest),
+                                                        LayoutConstant(*source), flags};
+    SpecializeTransfer(key, constants);
     VkPipeline pipeline = GetTransferPipeline(key);
     if (!pipeline) {
       Skip("transfer_pipeline");
@@ -1254,8 +1675,6 @@ void Fh1NativeExecutor::FlushColorTransfers(Surface& dest, size_t first, size_t 
     command_processor_.BindExternalGraphicsPipeline(pipeline);
     command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                            transfer_pipeline_layout_, 0, 1, &set, 0, nullptr);
-    const uint32_t constants[kTransferConstantCount] = {LayoutConstant(dest),
-                                                        LayoutConstant(*source), flags};
     command_buffer.CmdVkPushConstants(transfer_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                       sizeof(constants), constants);
     for (; i < source_end; ++i) {
@@ -1327,6 +1746,9 @@ void Fh1NativeExecutor::FlushDepthTransfersExported(Surface& dest, size_t first,
     key.sample_mask = sample_mask;
     key.source_kind = SourceKind(source->key.is_depth, source->key.format);
     key.source_msaa = source->samples > 1;
+    const uint32_t constants[kTransferConstantCount] = {LayoutConstant(dest),
+                                                        LayoutConstant(*source), flags};
+    SpecializeTransfer(key, constants);
     VkPipeline pipeline = GetTransferPipeline(key);
     if (!pipeline) {
       Skip("transfer_pipeline");
@@ -1336,8 +1758,6 @@ void Fh1NativeExecutor::FlushDepthTransfersExported(Surface& dest, size_t first,
     command_processor_.BindExternalGraphicsPipeline(pipeline);
     command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                            transfer_pipeline_layout_, 0, 1, &set, 0, nullptr);
-    const uint32_t constants[kTransferConstantCount] = {LayoutConstant(dest),
-                                                        LayoutConstant(*source), flags};
     command_buffer.CmdVkPushConstants(transfer_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                       sizeof(constants), constants);
     for (; i < source_end; ++i) {
@@ -1677,7 +2097,9 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   // The extent estimate reads vertices when clipping is off.
   const bool memo_allowed = draw.state_epoch && !draw.memexport &&
                             !register_file_.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
-  PrepareMemo& memo = prepare_memo_;
+  PrepareMemo& memo =
+      prepare_memos_[draw.state_is_hash ? (draw.state_epoch >> 40) & (std::size(prepare_memos_) - 1)
+                                        : 0];
   ++prepare_calls_;
   if (memo_allowed && memo.state_epoch == draw.state_epoch &&
       memo.vertex_shader == draw.vertex_shader &&
@@ -1788,7 +2210,9 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   if (same_targets && length_tiles_32bpp <= same_targets->length_tiles) return;
 
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i])) used_bits &= ~(1u << i);
+    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i], height_used)) {
+      used_bits &= ~(1u << i);
+    }
   }
   pending_used_bits_ = used_bits;
   if (depth_stencil_written && (used_bits & 1)) {
@@ -1883,8 +2307,52 @@ bool Fh1NativeExecutor::BindTargets(VulkanRenderTargetCache::RenderPassKey& key_
     bound_bits_ |= 1u << i;
   }
   key_out.depth_and_color_used = bound_bits_;
+  // Every used surface was bound, so this is the bound surfaces' scope.
+  bound_rendering_id_ = rendering_id;
   if (!used_bits) Count("draw_writes_nothing");
+  draw_shading_rate_ = {1, 1};
+  if (!coarse_shading_.empty()) {
+    const uint64_t id = rendering_id;
+    auto it = shading_rate_by_rendering_.find(id);
+    if (it == shading_rate_by_rendering_.end()) {
+      std::string label;
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        if (bound_bits_ & (1u << i)) label += (label.empty() ? "" : "+") + keys[i].Describe();
+      }
+      VkExtent2D rate = {1, 1};
+      for (const auto& [rendering, entry_rate] : coarse_shading_) {
+        if (rendering == label) rate = entry_rate;
+      }
+      it = shading_rate_by_rendering_.emplace(id, rate).first;
+    }
+    draw_shading_rate_ = it->second;
+  }
   return true;
+}
+
+void Fh1NativeExecutor::UpdateCoarseShading() {
+  const std::string spec = command_processor_.GetVulkanDevice()->properties().pipelineFragmentShadingRate
+                               ? REXCVAR_GET(fh1_coarse_shading)
+                               : std::string();
+  if (spec == coarse_shading_spec_) return;
+  coarse_shading_spec_ = spec;
+  coarse_shading_.clear();
+  shading_rate_by_rendering_.clear();
+  size_t start = 0;
+  while (start < spec.size()) {
+    size_t end = spec.find(',', start);
+    if (end == std::string::npos) end = spec.size();
+    const std::string entry = spec.substr(start, end - start);
+    start = end + 1;
+    const size_t equals = entry.rfind('=');
+    const size_t times = entry.rfind('x');
+    if (equals == std::string::npos || times == std::string::npos || times < equals) continue;
+    const uint32_t width = uint32_t(std::atoi(entry.c_str() + equals + 1));
+    const uint32_t height = uint32_t(std::atoi(entry.c_str() + times + 1));
+    auto valid = [](uint32_t size) { return size == 1 || size == 2 || size == 4; };
+    if (!valid(width) || !valid(height)) continue;
+    coarse_shading_.emplace_back(entry.substr(0, equals), VkExtent2D{width, height});
+  }
 }
 
 uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
@@ -1896,6 +2364,58 @@ uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
   }
   id &= ~(uint64_t(1) << 63);
   return id | 1;
+}
+
+void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
+                                          const VulkanShader::VulkanTranslation* pixel) {
+  const auto& dir = REXCVAR_GET(vulkan_shader_discovery_dir);
+  if (dir.empty() || REXCVAR_GET(vulkan_shader_discovery_frame) <= 0) return;
+  if (frame_ != uint64_t(REXCVAR_GET(vulkan_shader_discovery_frame))) {
+    if (shader_discovery_draws_.is_open()) shader_discovery_draws_.close();
+    return;
+  }
+  const auto root = rex::to_path(dir);
+  if (!shader_discovery_started_) {
+    shader_discovery_started_ = true;
+    std::error_code error;
+    std::filesystem::create_directories(root, error);
+    if (!error) shader_discovery_draws_.open(root / "draws.jsonl", std::ios::trunc);
+    if (!shader_discovery_draws_) REXGPU_WARN("Cannot write shader discovery to {}", dir);
+  }
+  if (!shader_discovery_draws_) return;
+  auto capture = [&](const VulkanShader::VulkanTranslation* translation) {
+    if (!translation || !translation->is_valid()) return std::string();
+    const auto& bytes = translation->replaced_binary().empty()
+                            ? translation->translated_binary() : translation->replaced_binary();
+    const auto name = VulkanShaderOverrideFilename(translation->shader().ucode_data_hash(),
+                                                    translation->modification(), bytes);
+    if (shader_discovery_written_.insert(name).second) {
+      std::ofstream out(root / name, std::ios::binary);
+      if (!out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size())) {
+        REXGPU_WARN("Cannot write discovered shader {}", name);
+        return std::string();
+      }
+    }
+    return name;
+  };
+  const auto vs = capture(vertex), ps = capture(pixel);
+  shader_discovery_draws_ << fmt::format(
+      "{{\"frame\":{},\"vertex\":\"{}\",\"pixel\":\"{}\",\"hud\":{},\"surfaces\":[",
+      frame_, vs, ps, hud_draw_);
+  bool first = true;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!(bound_bits_ & (1u << i))) continue;
+    const auto& key = pending_keys_[i];
+    const auto* surface = FindSurface(key.Pack());
+    if (!surface) continue;
+    shader_discovery_draws_ << fmt::format(
+        "{}{{\"slot\":{},\"key\":\"{:08X}\",\"depth\":{},\"base_tiles\":{},"
+        "\"pitch_tiles\":{},\"format\":{},\"width\":{},\"height\":{},\"samples\":{}}}",
+        first ? "" : ",", i, key.Pack(), key.is_depth, key.base_tiles, key.pitch_tiles,
+        key.format, surface->width * scale_, surface->image_height * scale_, surface->samples);
+    first = false;
+  }
+  shader_discovery_draws_ << "]}\n";
 }
 
 void Fh1NativeExecutor::BeginDrawRendering() {
@@ -1916,15 +2436,16 @@ void Fh1NativeExecutor::BeginDrawRendering() {
       FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, true);
     }
   }
-  if (command_processor_.IsFh1RenderingOpen(DrawRenderingId(bound_bits_))) {
+  const uint64_t bound_id = bound_rendering_id_;
+  if (command_processor_.IsFh1RenderingOpen(bound_id)) {
     // The draw continues the open rendering unless pending barriers end it;
     // then it begins anew below as before.
     command_processor_.SubmitBarriers(false);
-    if (command_processor_.IsFh1RenderingOpen(DrawRenderingId(bound_bits_))) {
+    if (command_processor_.IsFh1RenderingOpen(bound_id)) {
       const int32_t split = REXCVAR_GET(fh1_debug_rendering_split_draws);
       if (split <= 0 || ++rendering_draws_ < uint32_t(split)) {
         attachment_barriers_skipped_ = false;
-        rendering_id_ = DrawRenderingId(bound_bits_);
+        rendering_id_ = bound_id;
         if (clears) FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, false);
         return;
       }
@@ -1963,7 +2484,7 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     width = pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2) * scale_;
     height = SurfaceHeight(pitch_tiles, msaa) * scale_;
   }
-  const uint64_t id = DrawRenderingId(bound_bits_);
+  const uint64_t id = bound_id;
   if (attachment_barriers_skipped_) {
     attachment_barriers_skipped_ = false;
     // Pending barriers (such as texture loads) end the rendering.
@@ -1999,12 +2520,18 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     if (label.empty()) label = "none";
     GpuMarkRendering(GpuLabel(label));
   }
+  if (vis_frame_) VisMarkRendering();
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
   if (clears) FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, false);
 }
 
 void Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
   if (!initialized_) return;
+  if (inspection_) {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (bound_bits_ & (1u << i)) ++inspection_draws_[pending_keys_[i].Pack()];
+    }
+  }
   pending_targets_valid_ = false;
   if (draw.occlusion_query_active) Count("draw_in_occlusion_query");
   ++draws_;
@@ -2180,7 +2707,8 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
       kImageShaders[kind][msaa].code) {
     image_pipelines_[kind][msaa] = ui::vulkan::util::CreateComputePipeline(
         command_processor_.GetVulkanDevice(), image_pipeline_layout_,
-        kImageShaders[kind][msaa].code, kImageShaders[kind][msaa].size);
+        kImageShaders[kind][msaa].code, kImageShaders[kind][msaa].size, nullptr, "main",
+        command_processor_.UsePersistentVkPipelineCache());
   }
   if (image_view != VK_NULL_HANDLE && !image_pipelines_[kind][msaa]) {
     Skip("resolve_image_pipeline");
@@ -2247,6 +2775,45 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   constants[3] = PackLayout(owner.base_tiles, owner.pitch_tiles, owner.msaa, owner.Is64bpp(),
                             owner.is_depth, owner.format) |
                  (host_sample_mode << 27);
+  // Reading the owner in its own layout, with the rectangle inside its pitch
+  // and EDRAM, every sample is the owner's own: the shader then skips the
+  // EDRAM relocation (two divisions by the pitch per sample on the GPU). 2x
+  // readers selecting samples 2 or 3 step into the next row and keep it.
+  {
+    const uint32_t msaa_x_log2 = uint32_t(owner.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+    const uint32_t msaa_y_log2 = uint32_t(owner.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+    const uint32_t columns = owner.pitch_tiles << uint32_t(owner.Is64bpp());
+    const uint32_t right_columns =
+        (uint32_t(source.rect.right) << msaa_x_log2) << uint32_t(owner.Is64bpp());
+    const uint32_t bottom_rows = uint32_t(source.rect.bottom) << msaa_y_log2;
+    const uint32_t select = sample_select & 0xFFFFu;
+    const bool select_in_pixel =
+        owner.msaa != uint32_t(xenos::MsaaSamples::k2X) ||
+        select == uint32_t(xenos::CopySampleSelect::k0) ||
+        select == uint32_t(xenos::CopySampleSelect::k1) ||
+        select == uint32_t(xenos::CopySampleSelect::k01);
+    if (resolve_key.base_tiles == owner.base_tiles &&
+        resolve_key.pitch_tiles == owner.pitch_tiles && resolve_key.msaa == owner.msaa &&
+        resolve_key.Is64bpp() == owner.Is64bpp() && resolve_key.is_depth == owner.is_depth &&
+        source.rect.left >= 0 && source.rect.top >= 0 && columns &&
+        right_columns <= columns * 80 &&
+        ((bottom_rows + 15) / 16) * columns <= 2048 && select_in_pixel) {
+      constants[3] |= 1u << 30;
+    }
+  }
+  // A single-sampled MSAA owner keeps one value for all of a pixel's guest
+  // samples, and a reader with its MSAA and width finds each of its pixel's
+  // samples in the same owner pixel: averaging 2 or 4 of them loads the same
+  // texel again for the same result (v * n / n is exact), so read one.
+  if (host_sample_mode == 3 && resolve_key.msaa == owner.msaa &&
+      resolve_key.Is64bpp() == owner.Is64bpp()) {
+    const uint32_t select = sample_select & 0xFFFFu;
+    if (select >= uint32_t(xenos::CopySampleSelect::k01) &&
+        select <= uint32_t(xenos::CopySampleSelect::k0123)) {
+      sample_select = (sample_select & ~0xFFFFu) |
+                      (select == uint32_t(xenos::CopySampleSelect::k23) ? 2u : 0u);
+    }
+  }
   constants[4] = sample_select;
   constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u);
   constants[6] = dest_base;
@@ -2254,6 +2821,10 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   constants[8] = image_row * scale_;
   constants[9] = image_endian;
   constants[10] = image2_view != VK_NULL_HANDLE ? image2_endian | (1u << 5) : 0u;
+  if (const VkPipeline specialized = GetSpecializedResolvePipeline(
+          image_view != VK_NULL_HANDLE, kind, msaa, constants)) {
+    pipeline = specialized;
+  }
   auto& command_buffer = command_processor_.deferred_command_buffer();
   command_processor_.BindExternalComputePipeline(pipeline);
   command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1,
@@ -2265,8 +2836,11 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
       constants);
   command_processor_.BeginDebugLabel(image_view != VK_NULL_HANDLE ? "fh1 resolve and texture"
                                                                   : "fh1 resolve");
-  command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 7) / 8,
-                               (uint32_t(rect.bottom - rect.top) + 7) / 8, 1);
+  // 16x16 groups, as fh1_native_resolve_memory.cs.hlsl's Vulkan variants.
+  if (!REXCVAR_GET(fh1_debug_skip_resolve_dispatches)) {
+    command_buffer.CmdVkDispatch((uint32_t(rect.right - rect.left) + 15) / 16,
+                                 (uint32_t(rect.bottom - rect.top) + 15) / 16, 1);
+  }
   command_processor_.EndDebugLabel();
   return true;
 }
@@ -2339,11 +2913,20 @@ void Fh1NativeExecutor::DumpResolveOutput(uint32_t address, uint32_t length) {
 
 bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
   // As the D3D12 executor: the first frames of each run of resolves to a new,
-  // large range are read back (car thumbnails the game saves).
+  // large range are read back (car thumbnails the game saves). So is a
+  // resolve to a range already resolved more times this frame than in the
+  // previous one: a capture drawn after the frame into one of its own
+  // targets, such as the photo mode picture the game encodes (#399).
   constexpr uint64_t kRunGapFrames = 4, kRunReadbackFrames = 2, kIdleFrames = 300,
                      kNewFrames = 120;
   constexpr uint32_t kMinLength = 256 * 1024;
   ResolveReadback& readback = resolve_readbacks_[(uint64_t(address) << 32) | length];
+  if (readback.count_frame != frame_) {
+    readback.previous_count = readback.count_frame + 1 == frame_ ? readback.count : 0;
+    readback.count = 0;
+    readback.count_frame = frame_;
+  }
+  ++readback.count;
   if (!readback.last_used_frame || frame_ > readback.last_used_frame + kRunGapFrames) {
     if (!readback.last_used_frame || frame_ > readback.last_used_frame + kIdleFrames) {
       readback.new_since_frame = frame_;
@@ -2351,50 +2934,132 @@ bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
     readback.run_start_frame = frame_;
   }
   readback.last_used_frame = frame_;
-  return length >= kMinLength && frame_ < readback.run_start_frame + kRunReadbackFrames &&
-         frame_ < readback.new_since_frame + kNewFrames;
+  const bool extra = readback.previous_count && readback.count > readback.previous_count;
+  return length >= kMinLength &&
+         (extra || (frame_ < readback.run_start_frame + kRunReadbackFrames &&
+                    frame_ < readback.new_since_frame + kNewFrames));
 }
 
 void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) {
-  PendingReadback readback = {address, length, VK_NULL_HANDLE, VK_NULL_HANDLE};
-  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          command_processor_.GetVulkanDevice(), length, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-          ui::vulkan::util::MemoryPurpose::kReadback, readback.buffer, readback.memory)) {
-    return Skip("resolve_readback_buffer");
+  if (readback_used_ + length > readback_size_) {
+    // The pending copies target the current buffer.
+    FlushResolveReadbacks();
+    if (length > readback_size_) {
+      const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+      const auto& dfn = vulkan_device->functions();
+      const VkDevice device = vulkan_device->device();
+      if (readback_buffer_) dfn.vkDestroyBuffer(device, readback_buffer_, nullptr);
+      if (readback_memory_) dfn.vkFreeMemory(device, readback_memory_, nullptr);
+      readback_buffer_ = VK_NULL_HANDLE;
+      readback_memory_ = VK_NULL_HANDLE;
+      readback_mapped_ = nullptr;
+      readback_size_ = 0;
+      VkDeviceSize size = 8 << 20;
+      while (size < length) size *= 2;
+      void* mapped = nullptr;
+      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+              vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+              ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer_, readback_memory_) ||
+          dfn.vkMapMemory(device, readback_memory_, 0, VK_WHOLE_SIZE, 0, &mapped) !=
+              VK_SUCCESS) {
+        return Skip("resolve_readback_buffer");
+      }
+      readback_mapped_ = static_cast<const uint8_t*>(mapped);
+      readback_size_ = size;
+    }
   }
+  PendingReadback readback = {address, length, readback_used_};
+  readback_used_ += (VkDeviceSize(length) + 255) & ~VkDeviceSize(255);
   config_.memory->Use(VulkanSharedMemory::Usage::kRead);
   command_processor_.SubmitBarriers(true);
-  const VkBufferCopy region = {address, 0, length};
+  const VkBufferCopy region = {address, readback.offset, length};
   command_processor_.deferred_command_buffer().CmdVkCopyBuffer(config_.memory->buffer(),
-                                                               readback.buffer, 1, &region);
+                                                               readback_buffer_, 1, &region);
   pending_readbacks_.push_back(readback);
   Count("resolve_readback_one_off");
 }
 
+void Fh1NativeExecutor::QueueDeferredReadback(uint32_t address, uint32_t length) {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (length > kDeferredReadbackSize) return;
+  if (!deferred_readback_buffer_) {
+    void* mapped = nullptr;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, kDeferredReadbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, deferred_readback_buffer_,
+            deferred_readback_memory_) ||
+        dfn.vkMapMemory(device, deferred_readback_memory_, 0, VK_WHOLE_SIZE, 0, &mapped) !=
+            VK_SUCCESS) {
+      return Skip("resolve_readback_deferred_buffer");
+    }
+    deferred_readback_mapped_ = static_cast<const uint8_t*>(mapped);
+  }
+  const VkDeviceSize size = (VkDeviceSize(length) + 255) & ~VkDeviceSize(255);
+  if (deferred_readback_next_ + size > kDeferredReadbackSize) deferred_readback_next_ = 0;
+  const VkDeviceSize offset = deferred_readback_next_;
+  // The ring is far larger than the copies in flight; if the GPU is that far
+  // behind, this frame's copy is dropped rather than waited for.
+  ApplyCompletedDeferredReadbacks();
+  for (const DeferredReadback& pending : deferred_readbacks_) {
+    if (pending.offset < offset + size && offset < pending.offset + pending.length) {
+      Count("resolve_readback_deferred_dropped");
+      return;
+    }
+  }
+  deferred_readback_next_ = offset + size;
+  config_.memory->Use(VulkanSharedMemory::Usage::kRead);
+  command_processor_.SubmitBarriers(true);
+  const VkBufferCopy region = {address, offset, length};
+  command_processor_.deferred_command_buffer().CmdVkCopyBuffer(
+      config_.memory->buffer(), deferred_readback_buffer_, 1, &region);
+  deferred_readbacks_.push_back(
+      {address, length, offset, command_processor_.GetCurrentSubmission()});
+  Count("resolve_readback_deferred");
+}
+
+void Fh1NativeExecutor::ApplyCompletedDeferredReadbacks() {
+  if (deferred_readbacks_.empty()) return;
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  if (deferred_readbacks_.front().submission > completed) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  VkMappedMemoryRange range = {};
+  range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  range.memory = deferred_readback_memory_;
+  range.size = VK_WHOLE_SIZE;
+  vulkan_device->functions().vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1, &range);
+  // In order: a later resolve over the same bytes wins, as on the GPU.
+  while (!deferred_readbacks_.empty() && deferred_readbacks_.front().submission <= completed) {
+    const DeferredReadback& pending = deferred_readbacks_.front();
+    config_.memory->CopyReadbackToGuest(pending.address,
+                                        deferred_readback_mapped_ + pending.offset,
+                                        pending.length);
+    deferred_readbacks_.pop_front();
+  }
+}
+
 void Fh1NativeExecutor::FlushResolveReadbacks() {
+  ApplyCompletedDeferredReadbacks();
   if (pending_readbacks_.empty()) return;
   command_processor_.Fh1AwaitAllQueueOperations();
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  VkMappedMemoryRange range = {};
+  range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  range.memory = readback_memory_;
+  range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
   // In order: a later resolve over the same bytes wins, as on the GPU.
   for (PendingReadback& pending : pending_readbacks_) {
-    uint8_t* destination = memory_.TranslatePhysical(pending.address);
-    void* mapped = nullptr;
-    if (destination &&
-        dfn.vkMapMemory(device, pending.memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
-      VkMappedMemoryRange range = {};
-      range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-      range.memory = pending.memory;
-      range.size = VK_WHOLE_SIZE;
-      dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
-      std::memcpy(destination, mapped, pending.length);
-      dfn.vkUnmapMemory(device, pending.memory);
-    }
-    dfn.vkDestroyBuffer(device, pending.buffer, nullptr);
-    dfn.vkFreeMemory(device, pending.memory, nullptr);
+    config_.memory->CopyReadbackToGuest(pending.address, readback_mapped_ + pending.offset,
+                                        pending.length);
   }
   pending_readbacks_.clear();
+  readback_used_ = 0;
+  // Everything has completed now, the deferred copies included.
+  ApplyCompletedDeferredReadbacks();
   Count("resolve_readback_flush");
 }
 
@@ -2439,6 +3104,19 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
                                                          .window_y_offset)))
                      : 0u;
   if (untile_height_ && !untile_band) EndUntiledTiling();
+  // UP-1.3: each predicated tile's resolve ends a band of the scene depth
+  // (the window offset moves its screen rows to the top of EDRAM).
+  if (!untile_height_ && camera_tracking_enabled_ && camera_scene_depth_valid_) {
+    const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+    const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    const uint32_t msaa = uint32_t(surface_info.msaa_samples);
+    if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa),
+                     msaa, depth_info.depth_format)
+            .Pack() == camera_scene_depth_) {
+      SnapshotCameraDepth(uint32_t(
+          std::max(0, -int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset))));
+    }
+  }
   CopyPlan plan;
   if (!PlanCopy(plan)) {
     if (plan.empty) {
@@ -2450,6 +3128,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     return false;
   }
   bool succeeded = true;
+  if (inspection_ && plan.copy) InspectResolve(plan, untile_band);
   const int32_t x0 = plan.x0, y0 = plan.y0, x1 = plan.x1, y1 = plan.y1;
   const Rect rect = {x0, y0, x1, y1};
   const uint32_t msaa = plan.msaa;
@@ -2610,8 +3289,16 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     }
     // One-off captures the CPU reads also need the guest layout at scale:
     // resolved again unscaled into the guest memory copy, from each guest
-    // pixel's first host pixel, and read back.
-    if (scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length)) {
+    // pixel's first host pixel, and read back. Small resolves also need an
+    // unscaled copy: the 32x32 scene luminance the auto exposure samples is
+    // also read at guest size, and stale there it pins the exposure at its
+    // daytime limit, overexposing the screen until about noon (#444).
+    constexpr uint32_t kUnscaledCopyMaxLength = 4096;
+    const bool one_off =
+        scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length);
+    bool unscaled_copy_complete = scale_ == 1 && complete;
+    if (scale_ > 1 && written_address &&
+        (one_off || extent_length <= kUnscaledCopyMaxLength)) {
       config_.memory->RequestRange(extent_start, extent_length);
       config_.memory->Use(VulkanSharedMemory::Usage::kComputeWrite,
                           std::make_pair(extent_start, extent_length));
@@ -2629,7 +3316,16 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
             uint32_t(plan.dest_base - offset), plan.dest_pitch, config_.memory->buffer(), offset,
             range, true);
       }
-      if (unscaled_complete) QueueResolveReadback(extent_start, extent_length);
+      if (unscaled_complete && one_off) QueueResolveReadback(extent_start, extent_length);
+      unscaled_copy_complete = complete && unscaled_complete;
+    }
+    // GPU validity tracking preserves this resolve, but CPU exposure reads
+    // still need its bytes in guest RAM (seen at lr 830A4880 on Apple silicon).
+    if (written_address && unscaled_copy_complete && extent_length &&
+        extent_length <= kUnscaledCopyMaxLength &&
+        plan.info.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_32_FLOAT &&
+        REXCVAR_GET(fh1_readback_small_float_resolves)) {
+      QueueDeferredReadback(extent_start, extent_length);
     }
     // Invalidates textures over the range (and marks it scaled at scale).
     config_.textures->MarkRangeAsResolved(extent_start, extent_length);
@@ -2674,7 +3370,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
   const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
   auto clear = [&](const SurfaceKey& key, uint32_t value, uint32_t value_lo) {
-    Surface* surface = GetOrCreateSurface(key);
+    Surface* surface = GetOrCreateSurface(key, std::max(uint32_t(y1), 1u));
     if (!surface) return Skip("resolve_clear_surface");
     const uint32_t is_64bpp = key.Is64bpp() ? 1 : 0;
     const uint32_t tile_width = (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> is_64bpp;
@@ -2735,10 +3431,166 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
 }
 
 void Fh1NativeExecutor::OnSwap(uint64_t frame) {
+  if (inspection_) FinishInspection(frame);
+  BeginInspection();
+  hud_snapshot_ready_ = hud_snapshot_taken_;
+  hud_snapshot_taken_ = false;
+  hud_scene_base_ = UINT32_MAX;
+  camera_depth_rows_ready_ = camera_depth_rows_;
+  camera_depth_rows_ = 0;
+  FinishCameraFrame();
+  AdvanceJitter();
   if (!initialized_) return;
+  ApplyCompletedDeferredReadbacks();
+  ReleaseRetiredImages(false);
+  UpdateCoarseShading();
   GpuDrain();
+  if (vis_query_pool_ != VK_NULL_HANDLE) {
+    if (vis_frame_) {
+      vis_frame_ = false;
+      vis_pending_ = vis_reset_;
+      vis_submission_ = command_processor_.GetCurrentSubmission();
+      vis_retries_ = 0;
+    }
+    VisDrain();
+    vis_ordinals_.clear();
+    if (!vis_pending_ && frame % uint64_t(REXCVAR_GET(fh1_visibility_census)) == 0) {
+      vis_frame_ = true;
+      vis_reset_ = false;
+      vis_label_ = UINT32_MAX;
+      vis_draws_.clear();
+    }
+  }
   frame_ = frame;
-  if (frame % 600 == 0) LogStats(frame);
+  if (frame % uint64_t(REXCVAR_GET(fh1_native_stats_frames)) == 0) LogStats(frame);
+}
+
+bool Fh1NativeExecutor::IsHudTarget() const {
+  if (!initialized_) return false;
+  const auto color_info =
+      register_file_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+  return color_info.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 &&
+         color_info.color_base == hud_scene_base_;
+}
+
+void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
+  NoteCameraDraw(draw);
+  hud_draw_ = false;
+  if (!initialized_ || draw.memexport || !draw.rasterization_done ||
+      !(draw.normalized_color_mask & 0xF)) {
+    return;
+  }
+  const auto color_info =
+      register_file_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+  if (color_info.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10) {
+    // FH1 composites the scene into the front buffer last in this format.
+    hud_scene_base_ = color_info.color_base;
+    return;
+  }
+  if (color_info.color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 ||
+      color_info.color_base != hud_scene_base_) {
+    return;
+  }
+  hud_draw_ = true;
+  // Untiled, the scene depth is whole by the HUD.
+  if (untile_height_) SnapshotCameraDepth(0);
+  if (!hud_snapshot_enabled_ || hud_snapshot_taken_) return;
+  hud_snapshot_taken_ = true;
+  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
+  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
+  // The HUD's view shares the scene's surface.
+  Surface* surface = FindSurface(MakeColorKey(color_info.color_base,
+                                              Fh1PitchTiles(surface_info.surface_pitch, msaa),
+                                              msaa, color_info.color_format)
+                                     .Pack());
+  if (!surface || surface->samples != 1) {
+    hud_snapshot_taken_ = false;
+    return;
+  }
+  const uint32_t width = surface->width * scale_;
+  // The rows the image holds: on demand they may stop short of the period.
+  const uint32_t height = surface->image_height * scale_;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  command_processor_.EndRenderPass();
+  if (hud_snapshot_.image != VK_NULL_HANDLE &&
+      (hud_snapshot_.width != width || hud_snapshot_.height != height ||
+       hud_snapshot_.format != surface->format)) {
+    // Earlier frames may still read it; only on a resolution change.
+    command_processor_.Fh1AwaitAllQueueOperations();
+    DestroyHudSnapshot();
+  }
+  if (hud_snapshot_.image == VK_NULL_HANDLE) {
+    VkImageCreateInfo image_info = {};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = surface->format;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            hud_snapshot_.image, hud_snapshot_.memory)) {
+      Skip("hud_snapshot_create");
+      return;
+    }
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = hud_snapshot_.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = surface->format;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn.vkCreateImageView(device, &view_info, nullptr, &hud_snapshot_.view) != VK_SUCCESS) {
+      DestroyHudSnapshot();
+      Skip("hud_snapshot_create");
+      return;
+    }
+    hud_snapshot_.key = surface->key;
+    hud_snapshot_.format = surface->format;
+    hud_snapshot_.width = width;
+    hud_snapshot_.height = height;
+  }
+  Transition(*surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_READ_BIT);
+  Transition(hud_snapshot_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_WRITE_BIT);
+  command_processor_.SubmitBarriers(true);
+  VkImageCopy region = {};
+  region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.dstSubresource = region.srcSubresource;
+  region.extent = {width, height, 1};
+  command_processor_.deferred_command_buffer().CmdVkCopyImage(
+      surface->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hud_snapshot_.image,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+  Count("hud_snapshot");
+}
+
+VkImageView Fh1NativeExecutor::TakeHudSnapshot(uint32_t width, uint32_t height) {
+  const bool ready = hud_snapshot_ready_;
+  hud_snapshot_ready_ = false;
+  if (!ready || hud_snapshot_.view == VK_NULL_HANDLE || hud_snapshot_.width < width ||
+      hud_snapshot_.height < height) {
+    return VK_NULL_HANDLE;
+  }
+  TransitionForSampling(hud_snapshot_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  return hud_snapshot_.view;
+}
+
+void Fh1NativeExecutor::DestroyHudSnapshot() {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (hud_snapshot_.view) dfn.vkDestroyImageView(device, hud_snapshot_.view, nullptr);
+  if (hud_snapshot_.image) dfn.vkDestroyImage(device, hud_snapshot_.image, nullptr);
+  if (hud_snapshot_.memory) dfn.vkFreeMemory(device, hud_snapshot_.memory, nullptr);
+  hud_snapshot_ = Surface();
+  hud_snapshot_ready_ = false;
 }
 
 void Fh1NativeExecutor::LogStats(uint64_t frame) {
@@ -2751,9 +3603,10 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     const double tick_ns = command_processor_.GetVulkanDevice()->properties().timestampPeriod;
     const double scale = tick_ns / 1e6 / double(gpu_frames_);
     REXGPU_INFO(
-        "FH1 native executor (Vulkan) gpu ms/frame over {} frames: frame {:.3f} transfers "
-        "{:.3f} resolves {:.3f} clears {:.3f} texture_reloads {:.3f} texture_loads {:.3f}",
-        gpu_frames_, gpu_ticks_[kGpuFrame] * scale, gpu_ticks_[kGpuTransfers] * scale,
+        "FH1 native executor (Vulkan) gpu ms/frame over {} frames ({} dropped): frame {:.3f} "
+        "transfers {:.3f} resolves {:.3f} clears {:.3f} texture_reloads {:.3f} texture_loads "
+        "{:.3f}",
+        gpu_frames_, gpu_dropped_frames_, gpu_ticks_[kGpuFrame] * scale, gpu_ticks_[kGpuTransfers] * scale,
         gpu_ticks_[kGpuResolves] * scale, gpu_ticks_[kGpuClears] * scale,
         gpu_ticks_[kGpuTextureReloads] * scale, gpu_ticks_[kGpuTextureLoads] * scale);
     std::vector<std::pair<uint64_t, uint32_t>> heavy;
@@ -2783,6 +3636,7 @@ void Fh1NativeExecutor::LogStats(uint64_t frame) {
     std::fill(gpu_label_counts_.begin(), gpu_label_counts_.end(), 0);
     gpu_ticks_ = {};
     gpu_frames_ = 0;
+    gpu_dropped_frames_ = 0;
   }
   if (!transfer_volume_.empty()) {
     std::vector<std::pair<uint64_t, std::string>> volume;
@@ -2838,7 +3692,9 @@ uint32_t Fh1NativeExecutor::GpuBegin() {
                                        base);
     slot.used = 1;
   }
-  if (slot.used + 2 > kGpuProfileQueries) return UINT32_MAX;
+  // The last query stays for the frame's end (GpuEndFrame), so a full slot
+  // still closes.
+  if (slot.used + 3 > kGpuProfileQueries) return UINT32_MAX;
   const uint32_t query = slot.used++;
   command_buffer.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_query_pool_,
                                      base + query);
@@ -2848,7 +3704,7 @@ uint32_t Fh1NativeExecutor::GpuBegin() {
 void Fh1NativeExecutor::GpuEnd(GpuPhase phase, uint32_t begin) {
   if (begin == UINT32_MAX) return;
   GpuProfileSlot& slot = gpu_slots_[gpu_slot_];
-  if (slot.used >= kGpuProfileQueries) return;
+  if (slot.used + 1 >= kGpuProfileQueries) return;
   const uint32_t query = slot.used++;
   command_processor_.deferred_command_buffer().CmdVkWriteTimestamp(
       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_query_pool_,
@@ -2891,6 +3747,148 @@ void Fh1NativeExecutor::GpuRenderingEnded(const char* ender) {
   gpu_rendering_begin_ = UINT32_MAX;
 }
 
+void Fh1NativeExecutor::VisMarkRendering() {
+  // Outside rendering: the queries are reset once, before the frame's first
+  // draw rendering; draws before it are not counted.
+  if (!vis_reset_) {
+    command_processor_.EndRenderPass();
+    command_processor_.deferred_command_buffer().CmdVkResetQueryPool(vis_query_pool_, 0,
+                                                                     kVisQueries);
+    vis_reset_ = true;
+  }
+  std::string label;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (bound_bits_ & (1u << i)) label += (label.empty() ? "" : "+") + pending_keys_[i].Describe();
+  }
+  if (label.empty()) label = "none";
+  auto [it, inserted] = vis_label_ids_.try_emplace(label, uint32_t(vis_labels_.size()));
+  if (inserted) {
+    vis_labels_.push_back(label);
+    vis_totals_.emplace_back();
+  }
+  vis_label_ = it->second;
+}
+
+bool Fh1NativeExecutor::VisOracleSkip(uint64_t key) {
+  const uint64_t ordinal = vis_ordinals_[key]++;
+  vis_key_ = key ^ (ordinal + 1) * 0x9E3779B97F4A7C15ull;
+  ++vis_oracle_draws_;
+  if (vis_frame_ || !REXCVAR_GET(fh1_visibility_oracle_skip)) return false;
+  const auto it = vis_oracle_.find(vis_key_);
+  if (it == vis_oracle_.end() || !(it->second & 1) ||
+      (REXCVAR_GET(fh1_visibility_oracle_late_only) && !(it->second & 2))) {
+    return false;
+  }
+  ++vis_oracle_skips_;
+  return true;
+}
+
+bool Fh1NativeExecutor::VisNoDepth() const {
+  return vis_frame_ && REXCVAR_GET(fh1_visibility_census_no_depth);
+}
+
+uint32_t Fh1NativeExecutor::VisBegin(const Fh1DrawInfo& draw, reg::RB_DEPTHCONTROL depth,
+                                     uint32_t vertex_count) {
+  if (!vis_frame_ || !vis_reset_ || vis_label_ == UINT32_MAX) return UINT32_MAX;
+  // Queries of one type cannot nest: the title's own query owns the pool.
+  if (draw.occlusion_query_active || vis_draws_.size() >= kVisQueries) {
+    ++vis_skipped_;
+    return UINT32_MAX;
+  }
+  uint32_t kind = 3;
+  if (depth.z_enable && depth.zfunc != xenos::CompareFunction::kAlways) {
+    const Shader* pixel = draw.pixel_shader;
+    const bool late =
+        pixel && (!pixel->implicit_early_z_write_allowed() ||
+                  (pixel->writes_color_target(0) &&
+                   draw_util::DoesCoverageDependOnAlpha(register_file_.Get<reg::RB_COLORCONTROL>())));
+    kind = depth.z_write_enable ? (late ? 1 : 0) : 2;
+  }
+  const uint32_t query = uint32_t(vis_draws_.size());
+  vis_draws_.push_back({vis_key_, vis_label_, vertex_count, kind});
+  command_processor_.deferred_command_buffer().CmdVkBeginQuery(vis_query_pool_, query, 0);
+  return query;
+}
+
+void Fh1NativeExecutor::VisEnd(uint32_t query) {
+  if (query == UINT32_MAX) return;
+  command_processor_.deferred_command_buffer().CmdVkEndQuery(vis_query_pool_, query);
+}
+
+void Fh1NativeExecutor::VisDrain() {
+  if (!vis_pending_ || command_processor_.GetCompletedSubmission() < vis_submission_) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  std::vector<uint64_t> results(vis_draws_.size() * 2);
+  if (!vis_draws_.empty()) {
+    const VkResult result = vulkan_device->functions().vkGetQueryPoolResults(
+        vulkan_device->device(), vis_query_pool_, 0, uint32_t(vis_draws_.size()),
+        results.size() * sizeof(uint64_t), results.data(), 2 * sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    bool unavailable = result != VK_SUCCESS && result != VK_NOT_READY;
+    for (size_t i = 0; i < vis_draws_.size() && !unavailable; ++i) {
+      unavailable = !results[i * 2 + 1];
+    }
+    if (unavailable && vis_retries_++ < 8) return;
+    if (unavailable) {
+      REXGPU_WARN("FH1 native executor (Vulkan): visibility census frame dropped");
+      vis_pending_ = false;
+      return;
+    }
+  }
+  vis_pending_ = false;
+  for (size_t i = 0; i < vis_draws_.size(); ++i) {
+    const VisDraw& draw = vis_draws_[i];
+    const uint64_t samples = results[i * 2];
+    uint64_t* v = vis_totals_[draw.label].v[draw.kind];
+    v[0] += 1;
+    v[1] += samples == 0;
+    v[2] += samples < 64;
+    v[3] += draw.vertices;
+    v[4] += samples == 0 ? draw.vertices : 0;
+    vis_oracle_[draw.key] = uint8_t(samples == 0) | uint8_t(draw.kind == 1) << 1;
+  }
+  if (vis_oracle_.size() > 1000000) vis_oracle_.clear();
+  if (++vis_frames_ % 10) return;
+  // Cumulative, by label and kind, the busiest renderings first.
+  std::vector<std::pair<uint64_t, uint32_t>> order;
+  uint64_t all[5] = {};
+  for (uint32_t label = 0; label < vis_totals_.size(); ++label) {
+    uint64_t draws = 0;
+    for (const auto& kind : vis_totals_[label].v) {
+      draws += kind[0];
+      for (int i = 0; i < 5; ++i) all[i] += kind[i];
+    }
+    order.emplace_back(draws, label);
+  }
+  std::sort(order.begin(), order.end(), std::greater<>());
+  const double frames = double(vis_frames_);
+  const auto share = [](uint64_t part, uint64_t whole) {
+    return 100.0 * double(part) / double(std::max<uint64_t>(whole, 1));
+  };
+  REXGPU_INFO(
+      "FH1 visibility census over {} frames: {:.0f} draws a frame, {:.1f} % pass no samples "
+      "({:.1f} % of vertices), {:.1f} % under 64; {} skipped",
+      vis_frames_, double(all[0]) / frames, share(all[1], all[0]), share(all[4], all[3]),
+      share(all[2], all[0]), vis_skipped_);
+  REXGPU_INFO("FH1 visibility oracle: {} of {} draws dropped since the last report",
+              vis_oracle_skips_, vis_oracle_draws_);
+  vis_oracle_skips_ = 0;
+  vis_oracle_draws_ = 0;
+  static const char* const kKinds[] = {"z-write", "z-write-late", "z-test", "no-z"};
+  for (size_t i = 0; i < order.size() && i < 12; ++i) {
+    const VisTotals& totals = vis_totals_[order[i].second];
+    for (uint32_t kind = 0; kind < kVisKinds; ++kind) {
+      const uint64_t* v = totals.v[kind];
+      if (!v[0]) continue;
+      REXGPU_INFO(
+          "FH1 visibility census {} {}: {:.1f} draws a frame, hidden {:.1f} % (vertices "
+          "{:.1f} % of {:.0f} a frame), under 64 samples {:.1f} %",
+          vis_labels_[order[i].second], kKinds[kind], double(v[0]) / frames, share(v[1], v[0]),
+          share(v[4], v[3]), double(v[3]) / frames, share(v[2], v[0]));
+    }
+  }
+}
+
 void Fh1NativeExecutor::GpuEndFrame() {
   if (gpu_query_pool_ == VK_NULL_HANDLE) return;
   GpuMarkRendering(UINT32_MAX);
@@ -2914,21 +3912,75 @@ void Fh1NativeExecutor::GpuDrain() {
   for (uint32_t index = 0; index < kGpuProfileSlots; ++index) {
     GpuProfileSlot& slot = gpu_slots_[index];
     if (!slot.pending || slot.submission > completed) continue;
-    ticks.resize(slot.used);
-    if (vulkan_device->functions().vkGetQueryPoolResults(
-            vulkan_device->device(), gpu_query_pool_, index * kGpuProfileQueries, slot.used,
-            ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
-            VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+    // Each query's value and availability: a query the frame wrote but the
+    // driver reports unavailable (Turnip, in the untiled race) costs only the
+    // spans that use it, not the whole frame.
+    ticks.resize(size_t(slot.used) * 2);
+    const VkResult result = vulkan_device->functions().vkGetQueryPoolResults(
+        vulkan_device->device(), gpu_query_pool_, index * kGpuProfileQueries, slot.used,
+        ticks.size() * sizeof(uint64_t), ticks.data(), 2 * sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    uint32_t unavailable = 0;
+    for (uint32_t query = 0; query < slot.used; ++query) {
+      unavailable += !ticks[size_t(query) * 2 + 1];
+    }
+    if (result != VK_SUCCESS && result != VK_NOT_READY) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        REXGPU_WARN("FH1 native executor (Vulkan): GPU profile results failed ({}), {} queries",
+                    int(result), slot.used);
+      }
+    } else if (unavailable && slot.retries < 8) {
+      // Timestamps that land in a later submission than the one the slot
+      // waited on: read the slot again at the next swap.
+      ++slot.retries;
+      continue;
+    } else if (unavailable) {
+      static uint32_t warned = 0;
+      if (warned < 4) {
+        ++warned;
+        uint32_t first = 0;
+        while (first < slot.used && ticks[size_t(first) * 2 + 1]) ++first;
+        REXGPU_WARN(
+            "FH1 native executor (Vulkan): GPU profile: {} of {} queries unavailable after {} "
+            "swaps (first {})",
+            unavailable, slot.used, slot.retries, first);
+      }
+    }
+    const auto available = [&](uint32_t query) { return ticks[size_t(query) * 2 + 1] != 0; };
+    const auto tick = [&](uint32_t query) { return ticks[size_t(query) * 2]; };
+    bool frame_measured = false;
+    // MoltenVK samples timestamps at Metal encoder boundaries, and one after
+    // the frame's last encoder may never become available: end the frame at
+    // its latest available timestamp instead.
+    uint64_t frame_end_tick = 0;
+    for (uint32_t query = 1; query < slot.used; ++query) {
+      if (available(query)) frame_end_tick = std::max(frame_end_tick, tick(query));
+    }
+    for (const auto& span : slot.spans) {
+      if (span[0] == uint32_t(kGpuFrame) && available(span[1]) &&
+          (available(span[2]) || frame_end_tick > tick(span[1]))) {
+        frame_measured = true;
+      }
+    }
+    if ((result == VK_SUCCESS || result == VK_NOT_READY) && frame_measured) {
       for (const auto& [phase, begin, end] : slot.spans) {
-        if (ticks[end] <= ticks[begin]) continue;
+        if (phase == uint32_t(kGpuFrame) && available(begin) && !available(end)) {
+          if (frame_end_tick > tick(begin)) gpu_ticks_[phase] += frame_end_tick - tick(begin);
+          continue;
+        }
+        if (!available(begin) || !available(end) || tick(end) <= tick(begin)) continue;
         if (phase < kGpuPhases) {
-          gpu_ticks_[phase] += ticks[end] - ticks[begin];
+          gpu_ticks_[phase] += tick(end) - tick(begin);
         } else if (phase - kGpuPhases < gpu_label_ticks_.size()) {
-          gpu_label_ticks_[phase - kGpuPhases] += ticks[end] - ticks[begin];
+          gpu_label_ticks_[phase - kGpuPhases] += tick(end) - tick(begin);
           ++gpu_label_counts_[phase - kGpuPhases];
         }
       }
       ++gpu_frames_;
+    } else {
+      ++gpu_dropped_frames_;
     }
     slot = GpuProfileSlot();
   }

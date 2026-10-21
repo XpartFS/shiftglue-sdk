@@ -43,6 +43,8 @@ class VulkanTextureCache final : public TextureCache {
       xenos::AnisoFilter aniso_filter : 3;  // 17
       uint32_t mip_min_level : 4;           // 21
       uint32_t mip_base_map : 1;            // 22
+      // Outside the scene (kNoSceneFiltering): no player LOD bias.
+      uint32_t no_lod_bias : 1;             // 23
       // Maximum mip level is in the texture resource itself, but mip_base_map
       // can be used to limit fetching to mip_min_level.
     };
@@ -76,6 +78,7 @@ class VulkanTextureCache final : public TextureCache {
   ~VulkanTextureCache();
 
   void BeginSubmission(uint64_t new_submission_index) override;
+  void CompletedSubmissionUpdated(uint64_t completed_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
 
@@ -100,6 +103,16 @@ class VulkanTextureCache final : public TextureCache {
   bool bindless() const { return bindless_.set != VK_NULL_HANDLE; }
   // Bumped whenever texture bindings were updated (their views and slots).
   uint64_t bindings_generation() const { return bindings_generation_; }
+  // NL-3.2: let RequestTextures return at once when the requested bindings
+  // are unchanged and their textures already marked used and transitioned in
+  // this submission.
+  void set_skip_unchanged_requests(bool skip, bool verify) {
+    skip_unchanged_requests_ = skip;
+    verify_unchanged_requests_ = verify;
+  }
+  uint64_t unchanged_request_hits() const { return unchanged_request_hits_; }
+  // Verify mode: skippable requests whose textures were not all sampled.
+  uint64_t unchanged_request_mismatches() const { return unchanged_request_mismatches_; }
   VkDescriptorSetLayout bindless_descriptor_set_layout() const { return bindless_.layout; }
   VkDescriptorSet bindless_descriptor_set() const { return bindless_.set; }
   // The binding's cached slot inline; 3D as 2D, null and new views out of line.
@@ -122,7 +135,11 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t GetActiveBindingBindlessIndexSlow(uint32_t fetch_constant_index,
                                              xenos::FetchOpDimension dimension, bool is_signed);
 
-  SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
+  // anisotropic_override is the player's (the cvar), or kNoSceneFiltering
+  // for draws outside the scene: the title's own anisotropy, no LOD bias.
+  static constexpr int32_t kNoSceneFiltering = INT32_MIN;
+  SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding,
+                                         int32_t anisotropic_override) const;
 
   // Must be called for every used sampler at least once in a single submission,
   // and a submission must be open for this to be callable.
@@ -173,6 +190,7 @@ class VulkanTextureCache final : public TextureCache {
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
+  bool IsHostGammaSupported(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
   uint32_t GetHostFormatSwizzle(TextureKey key) const override;
 
@@ -180,6 +198,15 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t GetMaxHostTextureDepthOrArraySize(xenos::DataDimension dimension) const override;
 
   std::unique_ptr<Texture> CreateTexture(TextureKey key) override;
+  // The image of a texture with the key, scale_log2 times larger in both
+  // directions (a texture replacement) with levels mips; copy_words_out as
+  // VulkanTexture::copy_words (0 when scaled).
+  // Guest levels vulkan_texture_max_size leaves out of a new texture's image.
+  static uint32_t GetTextureLevelsToSkip(const TextureKey& key);
+  // skip_levels: the image starts at that guest level (vulkan_texture_max_size).
+  VkResult CreateTextureImageForKey(TextureKey key, uint32_t scale_log2, uint32_t levels,
+                                    VkImage& image, VmaAllocation& allocation,
+                                    uint32_t& copy_words_out, uint32_t skip_levels = 0);
 
   bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
                                           uint32_t length_scaled_alignment_log2 = 0) override;
@@ -244,14 +271,22 @@ class VulkanTextureCache final : public TextureCache {
     VkImage image() const { return image_; }
 
     // Doesn't transition (the caller must insert the barrier).
+    Usage usage() const { return usage_; }
     Usage SetUsage(Usage new_usage) {
       Usage old_usage = usage_;
       usage_ = new_usage;
+      if (old_usage != new_usage) {
+        ++static_cast<VulkanTextureCache&>(texture_cache()).usage_generation_;
+      }
       return old_usage;
     }
 
-    VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
-    VkImageView GetViewUncached(bool is_signed, uint32_t host_swizzle, bool is_array);
+    // srgb: the unsigned view in the sRGB version of the format
+    // (texture_gamma_host_srgb, IsHostGammaSupported).
+    VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true,
+                        bool srgb = false);
+    VkImageView GetViewUncached(bool is_signed, uint32_t host_swizzle, bool is_array,
+                                bool srgb = false);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
 
     // Loads by compute (vulkan_texture_load_compute_copy): the image was
@@ -260,6 +295,10 @@ class VulkanTextureCache final : public TextureCache {
     // in that format.
     uint32_t copy_words() const { return copy_words_; }
     void set_copy_words(uint32_t words) { copy_words_ = words; }
+    // Guest levels left out of the host image by vulkan_texture_max_size:
+    // host level 0 holds guest level skipped_levels().
+    uint32_t skipped_levels() const { return skipped_levels_; }
+    void set_skipped_levels(uint32_t levels) { skipped_levels_ = levels; }
     VkImageView GetCopyView();
     // PD-4: the bindless slot of a view GetView returned, remembered with the
     // last view of the signedness.
@@ -269,6 +308,15 @@ class VulkanTextureCache final : public TextureCache {
     // array view does not match).
     VkImageView GetCopyView2D();
 
+    // Texture replacements of another size: draws from a new image (scaled
+    // scale_log2 times, or the guest size again with 0). The old image, its
+    // views and their bindless slots are retired until the current submission
+    // completes.
+    void SwapImage(VkImage image, VmaAllocation allocation, uint32_t copy_words,
+                   uint32_t scale_log2, uint32_t levels);
+    uint32_t replacement_scale_log2() const { return replacement_scale_log2_; }
+    uint32_t replacement_levels() const { return replacement_levels_; }
+
    private:
     union ViewKey {
       uint32_t key;
@@ -276,6 +324,7 @@ class VulkanTextureCache final : public TextureCache {
         uint32_t is_signed_separate_view : 1;
         uint32_t host_swizzle : 12;
         uint32_t is_array : 1;
+        uint32_t is_srgb : 1;
       };
 
       ViewKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -319,6 +368,9 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImage image_;
     VmaAllocation allocation_;
+    uint32_t replacement_scale_log2_ = 0;
+    uint32_t replacement_levels_ = 0;
+    uint32_t skipped_levels_ = 0;
     uint32_t copy_words_ = 0;
     VkImageView copy_view_ = VK_NULL_HANDLE;
     VkImageView copy_view_2d_ = VK_NULL_HANDLE;
@@ -418,6 +470,36 @@ class VulkanTextureCache final : public TextureCache {
   // on Windows versions before 10, may have an allocation count limit as low as
   // 4096.
   VmaAllocator vma_allocator_ = VK_NULL_HANDLE;
+  // vulkan_texture_memory_prealloc_mb: device-local texture memory allocated at
+  // startup, used by textures whose memory types allow it.
+  VmaPool texture_pool_ = VK_NULL_HANDLE;
+  uint32_t texture_pool_memory_type_ = UINT32_MAX;
+
+  // Creates the image in texture_pool_ when it can, else in VMA's default pools.
+  // Texture replacements (pipeline/texture/replacement.h): uploads the
+  // replacement of a texture loaded from guest memory; true when replaced.
+  bool TryLoadTextureReplacement(VulkanTexture& texture);
+  // Back to a guest-size image, for guest data without a replacement or
+  // resolve output.
+  void UseGuestImage(VulkanTexture& texture);
+  // Rebinds a texture whose image changed.
+  void OnTextureImageSwitched(Texture& texture);
+  // Images, views and upload buffers a texture replacement stopped using,
+  // destroyed once their submission completes.
+  struct RetiredReplacementResources {
+    uint64_t submission = 0;
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    std::vector<VkImageView> bindless_views;
+    std::vector<VkImageView> views;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation buffer_allocation = VK_NULL_HANDLE;
+  };
+  std::vector<RetiredReplacementResources> retired_replacement_resources_;
+  void DestroyRetiredReplacementResources(uint64_t completed_submission_index);
+
+  VkResult CreateTextureImage(const VkImageCreateInfo& image_create_info, VkImage& image,
+                              VmaAllocation& allocation);
 
   static const HostFormatPair kBestHostFormats[64];
   static const HostFormatPair kHostFormatGBGRUnaligned;
@@ -462,6 +544,17 @@ class VulkanTextureCache final : public TextureCache {
     uint64_t overflows = 0;
   } bindless_;
   uint64_t bindings_generation_ = 0;
+  // NL-3.2: the bindings whose textures RequestTextures marked as used and
+  // transitioned for sampling, valid while the submission and every
+  // texture's usage are unchanged (usage_generation_, bumped by SetUsage).
+  bool skip_unchanged_requests_ = false;
+  bool verify_unchanged_requests_ = false;
+  uint64_t unchanged_request_mismatches_ = 0;
+  uint32_t sampled_ready_mask_ = 0;
+  uint64_t sampled_ready_submission_ = UINT64_MAX;
+  uint64_t sampled_ready_usage_generation_ = UINT64_MAX;
+  uint64_t usage_generation_ = 0;
+  uint64_t unchanged_request_hits_ = 0;
   // Views given slots outside the per-binding cache (3D as 2D, null views):
   // view to (array, slot).
   std::unordered_map<VkImageView, std::pair<uint32_t, uint32_t>> bindless_view_slots_;

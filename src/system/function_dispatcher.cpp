@@ -1,3 +1,4 @@
+#include <rex/cs_scheduler.h>
 /**
  * @file        system/function_dispatcher.cpp
  * @brief       Guest function dispatch coordinator for recompiled code
@@ -83,6 +84,7 @@ bool FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address) {
   ctx->lr = 0xBCBCBCBC;
 
   ctx->dispatch_address = address;
+  cs_scheduler::Callback callback_schedule;
   fn(*ctx, memory_->virtual_membase());
   ctx->dispatch_address = 0;
 
@@ -150,7 +152,7 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
   PROFILE_INTERRUPT_DISPATCHED();
 
   // Hold the global lock during interrupt dispatch.
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(rex::thread::LockSource::kInterrupt);
 
   auto* ctx = thread_state->context();
   assert_true(arg_count <= 5);

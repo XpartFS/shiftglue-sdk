@@ -115,6 +115,11 @@ bool Fh1PlanResolve(const RegisterFile& regs, const memory::Memory& memory,
     plan.kind = "depth" + std::to_string(uint32_t(plan.depth_info.depth_format));
   } else {
     switch (xenos::TextureFormat(dest_info.copy_dest_format)) {
+      // The livery editor resolves its single-channel masks from RGBA8.
+      case xenos::TextureFormat::k_8:
+        pack = 6;
+        bpb_log2 = 0;
+        break;
       case xenos::TextureFormat::k_8_8_8_8:
         pack = 0;
         break;
@@ -126,6 +131,11 @@ bool Fh1PlanResolve(const RegisterFile& regs, const memory::Memory& memory,
         break;
       case xenos::TextureFormat::k_16_16_16_16_FLOAT:
         pack = 3;
+        bpb_log2 = 3;
+        break;
+      // Depth of field resolves its 16_16_16_16_FLOAT target into one (#425).
+      case xenos::TextureFormat::k_16_16_16_16:
+        pack = 5;
         bpb_log2 = 3;
         break;
       default:

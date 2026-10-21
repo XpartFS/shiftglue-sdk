@@ -12,6 +12,7 @@
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
+#include <rex/cs_scheduler.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -27,6 +28,9 @@ extern "C" {
 }  // extern "C"
 
 REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
+REXCVAR_DEFINE_BOOL(xma_decode_kicks_inline, false, "Audio",
+                    "Decode a kicked XMA context on the thread that wrote the kick register "
+                    "instead of leaving it to the decoder thread");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -138,6 +142,7 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 }
 
 void XmaDecoder::WorkerThreadMain() {
+  cs_scheduler::Actor scheduled(UINT64_C(0x8000000000000007));
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
@@ -149,6 +154,7 @@ void XmaDecoder::WorkerThreadMain() {
         PROFILE_XMA_FRAME_DECODED();
       }
       did_work = did_work || worked;
+      cs_scheduler::Call(n);
     }
 
     if (paused_) {
@@ -293,17 +299,22 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         context.Enable();
       }
     }
-    // Decode inline. waiting on the worker sweep stalls the realtime
-    // audio thread 50-100ms during kick bursts.
-    for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
-      if (kicked_value & 1) {
-        uint32_t context_id = base_context_id + i;
-        auto& context = contexts_[context_id];
-        if (context.Work()) {
-          context.SignalWorkDone();
+    // Decode inline by default: waiting on the worker sweep stalled the
+    // realtime audio thread 50-100 ms during kick bursts. The cvar leaves the
+    // decode to the worker thread, to measure what the inline decode costs
+    // the guest audio thread (NEXT_LEVEL_RESEARCH.md NL-4.1).
+    if (REXCVAR_GET(xma_decode_kicks_inline)) {
+      for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+        if (kicked_value & 1) {
+          uint32_t context_id = base_context_id + i;
+          auto& context = contexts_[context_id];
+          if (context.Work()) {
+            context.SignalWorkDone();
+          }
         }
       }
     }
+    PERF_counter_inc(kXmaWorkEventSets);
     work_event_->Set();
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
     // Context lock command.

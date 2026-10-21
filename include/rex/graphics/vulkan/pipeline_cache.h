@@ -11,6 +11,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -90,7 +92,21 @@ class VulkanPipelineCache {
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);
+  enum class TranslationRequest { kReady, kPending, kFailed };
+  // EnsureShadersTranslated, but with vulkan_async_shader_translation a
+  // shader not translated yet goes to a worker and the draw is skipped
+  // (kPending) until it is ready, as for a pipeline still being built.
+  TranslationRequest RequestShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
+                                              VulkanShader::VulkanTranslation* pixel_shader);
   // TODO(Triang3l): Return a deferred creation handle.
+  // The persistent driver pipeline cache (vulkan_pipeline_cache_persist), for
+  // pipelines other subsystems create, or null. Each use counts a creation so
+  // the cache is saved again.
+  VkPipelineCache UsePersistentVkPipelineCache() {
+    vk_pipeline_cache_creations_.fetch_add(1, std::memory_order_relaxed);
+    return vk_pipeline_cache_;
+  }
+
   bool ConfigurePipeline(
       VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
@@ -98,6 +114,12 @@ class VulkanPipelineCache {
       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
       const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
   bool IsCreatingPipelines() const;
+  // vulkan_async_pipeline_bind_on_replay: draws record a pipeline that is
+  // still being built, bound by AwaitPipeline when the submission replays.
+  bool binds_on_replay() const { return bind_on_replay_; }
+  // Waits up to wait_ms for the pipeline behind a ConfigurePipeline handle;
+  // VK_NULL_HANDLE when it is still not built or failed.
+  VkPipeline AwaitPipeline(void* handle, int32_t wait_ms, double* waited_ms_out = nullptr) const;
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
                                     bool* is_placeholder_out = nullptr) const;
@@ -200,12 +222,13 @@ class VulkanPipelineCache {
     xenos::StencilOp stencil_back_depth_fail_op : 3;     // 6
     xenos::CompareFunction stencil_back_compare_op : 3;  // 9
     uint32_t sample_rate_shading : 1;                    // 10
+    uint32_t inspection_view : 2;
 
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     // Including all the padding, for a stable hash.
-    static constexpr uint32_t kVersion = 0x20260228;
+    static constexpr uint32_t kVersion = 0x20261018;
     PipelineDescription() {
       Reset();
     }
@@ -234,6 +257,13 @@ class VulkanPipelineCache {
   REXPACKEDSTRUCT(PipelineStoredDescription, {
     uint64_t description_hash;
     PipelineDescription description;
+  });
+  // spirv_specialize_texture_signs: a pipeline with the texture signs its
+  // shaders were specialized for. The hash covers the description and signs.
+  REXPACKEDSTRUCT(SpecializedStoredDescription, {
+    uint64_t hash;
+    PipelineDescription description;
+    uint32_t texture_signs[8];
   });
 
   struct Pipeline {
@@ -333,9 +363,23 @@ class VulkanPipelineCache {
   };
 
 
-  // Can be called from multiple threads.
   bool TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                VulkanShader::VulkanTranslation& translation);
+  // The two halves of TranslateAnalyzedShader: the binary and the module,
+  // which a worker may make, then the binding layouts and the observer, on
+  // the command processor thread.
+  bool TranslateShaderBinary(SpirvShaderTranslator& translator,
+                             VulkanShader::VulkanTranslation& translation, bool& observe);
+  void FinishShaderTranslation(VulkanShader::VulkanTranslation& translation, bool observe);
+  struct TranslationJob {
+    VulkanShader::VulkanTranslation* translation;
+    bool translated;
+    bool observe;
+  };
+  void TranslationThread();
+  void CollectTranslations();
+  // Waits for the queued translations and finishes them.
+  void StopTranslationThread();
 
   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
                                             PipelineRenderTarget& render_target_out) const;
@@ -376,6 +420,13 @@ class VulkanPipelineCache {
   bool EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
                              VkShaderModule fragment_shader_override = VK_NULL_HANDLE);
   void CreationThread(size_t thread_index);
+  void StartBackgroundPrewarm(std::vector<PipelineCreationArguments> creations);
+  // Creates the stored pipeline at the index, or waits for the thread that
+  // already is.
+  void RunBackgroundPrewarmEntry(size_t index);
+  // For a pipeline the background prewarm has not built yet.
+  void AwaitBackgroundPrewarm(const Pipeline& pipeline);
+  void StopBackgroundPrewarm();
   void CreateQueuedPipelinesOnProcessorThread();
   void ProcessDeferredPipelineDestructions(bool force_all);
 
@@ -388,6 +439,22 @@ class VulkanPipelineCache {
   string::StringBuffer ucode_disasm_buffer_;
   // Reusable shader translator on the command processor thread.
   std::unique_ptr<SpirvShaderTranslator> shader_translator_;
+  // vulkan_async_shader_translation: one worker, so that a shader's first
+  // translation, which sets its bindings, is never racing another one.
+  bool async_translation_ = false;
+  bool bind_on_replay_ = false;
+  // vulkan_async_pipeline_no_placeholder, or implied by bind_on_replay_.
+  bool no_placeholder_ = false;
+  std::unique_ptr<SpirvShaderTranslator> async_shader_translator_;
+  std::unique_ptr<rex::thread::Thread> translation_thread_;
+  std::mutex translation_mutex_;
+  std::condition_variable translation_cond_;
+  std::deque<VulkanShader::VulkanTranslation*> translation_queue_;
+  std::vector<TranslationJob> translation_done_;
+  std::atomic<bool> translation_has_done_{false};
+  bool translation_stop_ = false;
+  // Queued or on the worker; only the command processor thread reads it.
+  std::unordered_set<const VulkanShader::VulkanTranslation*> translations_pending_;
   // FH1 precompiled SPIR-V (NP-12.6): translations looked up before the
   // translator runs; misses are translated as before.
   Fh1ShaderPack fh1_shader_pack_;
@@ -396,6 +463,11 @@ class VulkanPipelineCache {
   Fh1ShaderPack::Config Fh1ShaderPackConfig() const;
   std::atomic<uint64_t> fh1_shader_pack_hits_{0};
   std::atomic<uint64_t> fh1_shader_pack_misses_{0};
+  // vulkan_shader_overrides: swaps a valid translation's bytecode for its
+  // hand-edited form (or a vulkan_shader_override_dir file), keeping the
+  // original for captures.
+  void ApplyShaderOverride(VulkanShader::VulkanTranslation& translation);
+  std::atomic<uint32_t> shader_override_hits_{0};
   void ObserveTranslation(const VulkanShader& shader,
                           const VulkanShader::VulkanTranslation& translation);
 
@@ -437,6 +509,8 @@ class VulkanPipelineCache {
   // shader interlock when no Xenos pixel shader provided.
   VkShaderModule depth_only_fragment_shader_ = VK_NULL_HANDLE;
   VkShaderModule placeholder_pixel_shader_ = VK_NULL_HANDLE;
+  VkShaderModule inspection_overdraw_shader_ = VK_NULL_HANDLE;
+  std::mutex inspection_shader_mutex_;
   // Depth-only shaders for float24 emulation when no Xenos pixel shader is
   // provided in host render target mode.
   VkShaderModule depth_float24_truncate_fragment_shader_ = VK_NULL_HANDLE;
@@ -479,6 +553,9 @@ class VulkanPipelineCache {
   std::atomic<uint64_t> vk_pipeline_cache_creations_{0};
   uint64_t vk_pipeline_cache_saved_creations_ = 0;
   uint64_t vk_pipeline_cache_saved_time_ms_ = 0;
+  // The GPU commands thread's view: the creation count of the last save it
+  // requested (the save itself runs on the storage write thread).
+  uint64_t vk_pipeline_cache_requested_creations_ = 0;
   void LoadVkPipelineCache();
   void SaveVkPipelineCache();
 
@@ -492,6 +569,9 @@ class VulkanPipelineCache {
   // Pipeline storage output stream, for preload in the next emulator runs.
   FILE* pipeline_storage_file_ = nullptr;
   bool pipeline_storage_file_flush_needed_ = false;
+  // Specialized pipelines (SpecializedStoredDescription), flushed with the
+  // pipeline storage.
+  FILE* specialized_storage_file_ = nullptr;
 
   // Thread for asynchronous writing to the storage streams.
   void StorageWriteThread();
@@ -501,8 +581,10 @@ class VulkanPipelineCache {
   // thread is notified about its change via storage_write_request_cond_.
   std::deque<const Shader*> storage_write_shader_queue_;
   std::deque<PipelineStoredDescription> storage_write_pipeline_queue_;
+  std::deque<SpecializedStoredDescription> storage_write_specialized_queue_;
   bool storage_write_flush_shaders_ = false;
   bool storage_write_flush_pipelines_ = false;
+  bool storage_write_save_vk_pipeline_cache_ = false;
   bool storage_write_thread_shutdown_ = false;
   std::unique_ptr<rex::thread::Thread> storage_write_thread_;
 
@@ -517,6 +599,22 @@ class VulkanPipelineCache {
   bool creation_completion_set_event_ = false;
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads_;
+
+  // Stored pipelines created behind the running title
+  // (vulkan_pipeline_prewarm_background). Everything but the atomics is
+  // fixed once the threads start.
+  struct BackgroundPrewarm {
+    std::vector<PipelineCreationArguments> creations;
+    // 0 queued, 1 being created, 2 done.
+    std::unique_ptr<std::atomic<uint8_t>[]> states;
+    std::unordered_map<const Pipeline*, size_t> index;
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> remaining{0};
+    std::atomic<bool> stop{false};
+    std::chrono::steady_clock::time_point start;
+    std::vector<std::unique_ptr<rex::thread::Thread>> threads;
+  };
+  std::unique_ptr<BackgroundPrewarm> background_prewarm_;
 };
 
 }  // namespace rex::graphics::vulkan

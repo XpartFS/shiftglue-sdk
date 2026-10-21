@@ -13,8 +13,10 @@
 
 #include <array>
 #include <chrono>
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
 #include <intrin.h>
+#elif defined(__x86_64__)
+#include <x86intrin.h>  // __rdtsc
 #endif
 #include <atomic>
 #include <cstring>
@@ -24,11 +26,13 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/fh1_frame_inspector.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
@@ -41,10 +45,15 @@ namespace rex::stream {
 class ByteStream;
 }  // namespace rex::stream
 
+namespace rex::system::d3d_draw {
+struct Description;
+}  // namespace rex::system::d3d_draw
+
 namespace rex::graphics {
 
 class GraphicsSystem;
 class Shader;
+struct D3dPageWatch;
 
 enum class ReadbackResolveMode {
   kDisabled,
@@ -159,6 +168,10 @@ class CommandProcessor {
   // Replays a frame dump requested at startup (fh1_frame_replay); called on
   // the command processor thread once shader storage is initialized.
   virtual void RunRequestedFrameReplay() {}
+  // Restore a full dump register file without triggering MMIO write effects.
+  virtual void RestoreFrameDumpRegisters(std::span<const uint32_t> registers);
+  virtual std::shared_ptr<Fh1FrameInspector> frame_inspector() const { return {}; }
+  virtual bool OpenInspectionDump(const std::filesystem::path&, Fh1InspectionView) { return false; }
 
   bool is_paused() const { return paused_; }
   void Pause();
@@ -309,6 +322,13 @@ class CommandProcessor {
   // (writes guest memory, raises an interrupt, swaps, advances the ring read
   // pointer): results the CPU may read from then on must be in guest memory.
   virtual void FlushCpuVisibleResults() {}
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  // CS-0.4: run on the recorder, before publishing a guest completion.
+  virtual bool AwaitGuestGpuCompletion() { return false; }
+  void AwaitGuestGpuCompletionIfRequested();
+  // The default backend publishes immediately. Vulkan can retire on a worker.
+  virtual void PublishGuestCompletion(std::function<void()> completion);
+#endif
   virtual void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
@@ -503,6 +523,9 @@ class CommandProcessor {
   // predicated packets run as if every tile's bins were selected.
   bool untile_tiling_ = false;
   bool untile_select_all_ = false;
+  // Draws the backend skipped for a later untile pass (gpu_replay_floor_probe
+  // counts drawn draws as the decoded ones minus these).
+  uint64_t untile_skipped_draws_ = 0;
   // A bin select of a predicated tiling pass: 0 the first tile (bins 0-1),
   // 1 and up the later ones, -1 not a tiling pass.
   int32_t TilingPassOfSelect() const {
@@ -513,6 +536,8 @@ class CommandProcessor {
   // gpu_trace_bins_vblank: the indirect buffer nesting depth.
   uint32_t trace_ib_depth_ = 0;
  protected:
+  // Forgets the shader cache's shaders (before the backend destroys them).
+  void D3dShaderCacheReset();
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
@@ -534,10 +559,30 @@ class CommandProcessor {
 #endif  // REX_HAS_VULKAN
 
  private:
+  // Leaves new elements uninitialized on resize: a register run is resized
+  // into the batch and then overwritten whole, so zeroing it first is wasted
+  // work on the decoder thread.
+  template <typename T>
+  struct DefaultInitAllocator : std::allocator<T> {
+    template <typename U>
+    struct rebind {
+      using other = DefaultInitAllocator<U>;
+    };
+    using std::allocator<T>::allocator;
+    template <typename U>
+    void construct(U* p) noexcept {
+      ::new (static_cast<void*>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+      ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+  };
+  using RecordWords = std::vector<uint32_t, DefaultInitAllocator<uint32_t>>;
   struct RecordBatch {
     // Records: kRecordRun start count dwords (host order)..., kRecordOne index value,
     // kRecordCall function-index.
-    std::vector<uint32_t> words;
+    RecordWords words;
     std::vector<std::function<void()>> fns;
   };
   static constexpr uint32_t kRecordRun = 0;
@@ -570,6 +615,119 @@ class CommandProcessor {
     uint64_t hash = 0;
     uint32_t dword_count = 0;
   } decode_last_shader_load_[2];
+  // DL-1.1 wrong-image ceiling (gpu_d3d_census_skip_visible, read at each
+  // indirect buffer): the decoder skips the draws, shader loads and (at 2)
+  // ALU constant packets of the buffers the D3D census counts as visible.
+  // A skipped shader load is kept by type and done before the next draw
+  // that runs, so the fallback draws still see their shaders.
+  int32_t d3d_skip_visible_ = 0;
+  struct SkippedShaderLoad {
+    bool valid = false;
+    xenos::ShaderType type = xenos::ShaderType::kVertex;
+    uint32_t address = 0;
+    const uint32_t* ucode = nullptr;
+    uint32_t dword_count = 0;
+  } d3d_skipped_load_[2];
+  bool d3d_skipped_loads_pending_ = false;
+  // The census half of a draw packet; true if the packet was skipped.
+  bool D3dCensusDraw(memory::RingBuffer* reader, uint32_t count);
+  // Skips an ALU constant packet of a visible buffer; true if skipped.
+  bool D3dCensusSkipConstants(memory::RingBuffer* reader, uint32_t opcode, uint32_t count);
+  // Registers [first, first + count) may be skipped in a visible buffer.
+  bool D3dCensusSkippableRange(uint32_t first, uint32_t count) const;
+  void FlushSkippedShaderLoads();
+  // An IM_LOAD's work (also a D3D-level draw's pointer load).
+  void LoadGuestShader(xenos::ShaderType shader_type, uint32_t addr, uint32_t size_dwords);
+  // An IM_LOAD_IMMEDIATE's work; ucode is copied when recorded.
+  void LoadInlineShader(xenos::ShaderType shader_type, uint32_t guest_address,
+                        const uint32_t* ucode, uint32_t size_dwords);
+  // Registers [*first, *first + *count) a constant packet writes; false for
+  // other packets.
+  static bool ConstantPacketRange(const memory::RingBuffer& reader, uint32_t opcode,
+                                  uint32_t count, uint32_t* first, uint32_t* registers);
+  // A predicated type-3 packet that the bin mask and select drop.
+  bool PredicatedOut(uint32_t packet, uint32_t opcode) const;
+
+  // DL-1.2 D3D-level draws (rex/system/d3d_draw.h): a marker opens a window
+  // over the packets of one guest draw call, which ends at its draw packet.
+  // In verify mode the packets run and are compared with the description;
+  // in draw mode the packets the description covers are skipped and the
+  // description is applied and drawn at the draw packet.
+  struct D3dDrawWindow;
+  std::unique_ptr<D3dDrawWindow> d3d_draw_;
+  bool d3d_draw_open_ = false;
+  void D3dDrawMarker(uint32_t id, uint32_t mode);
+  // A packet inside an open window: true if it was consumed.
+  bool D3dDrawType0(memory::RingBuffer* reader, uint32_t packet);
+  bool D3dDrawType3(memory::RingBuffer* reader, uint32_t packet, uint32_t opcode,
+                    uint32_t count);
+  // Closes the window; in draw mode applies the skipped state first.
+  void D3dDrawAbort(uint32_t reason);
+  void D3dDrawApplyState(const system::d3d_draw::Description& description);
+  void D3dDrawVerify(const memory::RingBuffer& reader, uint32_t packet, uint32_t opcode,
+                     uint32_t count);
+  // Draws the description's draw packet (indexed, or auto-index with
+  // kFlagAutoIndex) as the packet `packet` would.
+  void D3dDrawIssue(const system::d3d_draw::Description& description, uint32_t packet);
+  void D3dDrawSwap();
+  // Counts a drawn description as a decoded draw (the scene measure).
+  void D3dDrawCountDraw();
+  // DL-2.1 slice: a replacement marker (kReplaceMagic, arena offset,
+  // (id << 2) | mode). Draw mode applies the description and draws it; verify
+  // mode opens a DL-1.2 window over the call's packets that follow.
+  void D3dSliceMarker(uint32_t offset, uint32_t id_mode);
+  // DL-2.1 list compiler (d3d_list_compiler.cpp): nested buffers (display
+  // lists) run from a compiled form, checked against their packet headers
+  // and control words at each run; register values, draw words and inline
+  // microcode are read from the buffer as it is at the run, so fixups are
+  // bindings. Mode (gpu_d3d_list_compile, read at each swap): 0 off, 1
+  // verify (compiled and modelled, then decoded and compared), 2 on.
+  struct D3dListCompiler;
+  std::unique_ptr<D3dListCompiler> d3d_lists_;
+  uint32_t d3d_list_mode_ = 0;
+  // Attempt 2 parts, read at each swap with the mode: the page watch
+  // validates compiled lists (gpu_d3d_list_watch) and watched lists replay
+  // their register writes from a host plan (gpu_d3d_list_host_regs).
+  bool d3d_list_watch_ = false;
+  bool d3d_list_host_regs_ = false;
+  // Write watch on guest physical pages (d3d_shader_cache.cpp), shared by the
+  // list compiler and the shader cache; made by the first user.
+  std::unique_ptr<D3dPageWatch> d3d_page_watch_;
+  D3dPageWatch& D3dPageWatchGet();
+  // Shader-load cache (d3d_shader_cache.cpp): IM_LOADs reuse their hash and,
+  // decoding inline, their shader while their microcode is unwritten
+  // (gpu_d3d_shader_cache, read at each swap: 0 off, 1 verify, 2 on).
+  struct D3dShaderCache;
+  std::unique_ptr<D3dShaderCache> d3d_shader_cache_;
+  uint32_t d3d_shader_cache_mode_ = 0;
+  // An IM_LOAD through the shader cache: true if it set the active shader;
+  // otherwise `hash` is the microcode's hash when the cache knows it (0 not).
+  bool D3dShaderCacheLoad(xenos::ShaderType shader_type, uint32_t addr, uint32_t size_dwords,
+                          const uint32_t* ucode, uint64_t& hash);
+  void D3dShaderCacheSwap();
+  // NA-2.4 owned draw programs (gpu_d3d_program, read at each swap: 0 off,
+  // 1-4 the cvar's modes): the decoder brackets each run of a list the
+  // game marked (system/d3d_program.h) with these calls, in order with the
+  // list's draws, so the backend knows which draws a program covers. The key
+  // is the buffer's (physical address << 32 | dwords).
+  virtual bool SupportsDrawPrograms() const { return false; }
+  virtual void DrawProgramBegin(uint64_t key) { (void)key; }
+  virtual void DrawProgramEnd() {}
+  uint32_t d3d_program_mode_ = 0;
+  // The depth of the pilot buffer being decoded (0: none); lists it calls
+  // are part of its program.
+  uint32_t d3d_program_depth_ = 0;
+  // Runs a nested buffer from its compiled form; false to decode it.
+  bool D3dListExecute(uint32_t ptr, uint32_t count);
+  // Verify: the buffer at this depth was modelled; it is decoded now and
+  // compared at its draws, shader loads and end (~0u: none).
+  uint32_t d3d_list_verify_depth_ = ~0u;
+  void D3dListVerifyDraw();
+  void D3dListVerifyLoad(uint32_t type, uint32_t address, uint32_t dwords);
+  void D3dListVerifyEnd();
+  void D3dListSwap();
+  // Runs packets of [base, base + count words) from word `offset` on.
+  void ExecutePacketsFrom(const uint32_t* base, uint32_t count, uint32_t offset);
   // PD-1.6: scratch registers whose writes do not write back (their
   // SCRATCH_UMSK bit is clear) are recorded once, with their latest value,
   // before anything that could observe them.
@@ -616,6 +774,13 @@ class CommandProcessor {
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;
+  // CS-0.1, decoder-owned: headers (including IB links), payloads and nested
+  // packets in decode order; reset on each XE_SWAP.
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  uint64_t session_pm4_hash_ = UINT64_C(14695981039346656037);
+  uint64_t session_pm4_words_ = 0;
+  uint64_t session_pm4_frame_ = 0;
+#endif
 };
 
 }  // namespace rex::graphics

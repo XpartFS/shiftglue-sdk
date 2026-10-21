@@ -88,6 +88,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // UP-1.7: write the draw's object slot with the fragment depth to the
+      // object slot image (kObjectSlotImageBinding), nearest fragment
+      // winning, for a temporal upscaler's per-object motion. Host render
+      // targets only.
+      uint32_t object_slot_output : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -307,6 +312,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_max;
     float tessellation_factor_range_min;
     float tessellation_factor_range_max;
+
+    // UP-1.7: the slot pixel shaders with object_slot_output write, and the
+    // row of the full frame the surface's first row is (predicated tiles).
+    uint32_t object_slot;
+    int32_t object_row_offset;
   };
 
   enum ConstantBuffer : uint32_t {
@@ -429,7 +439,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // 2D fetches in pixel shaders with the LOD computed from the pixel's
     // derivatives sample with implicit LOD (spirv_implicit_lod_2d).
     bool implicit_lod_2d;
+    // The same, only for fetches every pixel of the quad runs
+    // (spirv_implicit_lod_2d_uniform_turnip).
+    bool implicit_lod_2d_uniform;
+    // Shared memory reads go through one R32_UINT uniform texel buffer over
+    // all 512 MB (binding kSharedMemoryTexelBufferBinding) instead of a
+    // switch over the storage buffer bindings
+    // (vulkan_shared_memory_texel_buffer).
+    bool shared_memory_texel_buffer;
   };
+  static constexpr uint32_t kSharedMemoryTexelBufferBinding = 2;
+  // UP-1.7: the R32_UINT object slot image in the shared memory set.
+  static constexpr uint32_t kObjectSlotImageBinding = 3;
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
                         bool native_2x_msaa_no_attachments, bool edram_fragment_shader_interlock,
@@ -607,6 +628,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void StartFragmentShaderBeforeMain();
   void StartFragmentShaderInMain();
   void CompleteFragmentShaderInMain();
+  // UP-1.7, at the end of a pixel shader with object_slot_output.
+  void WriteObjectSlot();
 
   // Updates the current flow control condition (to be called in the beginning
   // of exec and in jumps), closing the previous conditionals if needed.
@@ -666,6 +689,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // replaces the value with +0 if the minimum of the two operands is 0. This
   // must be called with absolute values of operands - use GetAbsoluteOperand!
   spv::Id ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs, spv::Id operand_1_abs);
+  // The multiply rule under fast pixel math: replacement (+0 by default)
+  // where the product (or the multiply-add) is NaN.
+  spv::Id ZeroIfNan(spv::Id value, int num_components, spv::Id replacement = spv::NoResult);
   // Conditionally discard the current fragment. Changes the build point.
   void KillPixel(spv::Id condition, uint8_t memexport_eM_potentially_written_before);
   // Return type is a rex::bit_count(result.GetUsedResultComponents())-component
@@ -794,6 +820,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool is_depth_only_fragment_shader_ = false;
   // spirv_fast_pixel_math for the current (pixel) shader.
   bool fast_pixel_math_ = false;
+  // spirv_ieee_vertex_math for the current (vertex) shader: no multiply rule.
+  bool ieee_math_ = false;
 
   std::unique_ptr<SpirvBuilder> builder_;
 
@@ -911,6 +939,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantObjectSlot,
+    kSystemConstantObjectRowOffset,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
@@ -925,6 +955,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id GetBindlessArray(BindlessBinding binding);
 
   spv::Id buffers_shared_memory_;
+  // Only with features_.shared_memory_texel_buffer.
+  spv::Id texel_buffer_shared_memory_;
   spv::Id buffer_edram_;
 
   // Not using combined images and samplers because
@@ -1112,6 +1144,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // If the instruction-level predicate conditional is open, block after it (not
   // added to the function yet).
   spv::Block* cf_instruction_predicate_merge_;
+  // Loops entered and not yet left in the translation order (a predicated
+  // break may leave some pixels of a quad behind).
+  uint32_t cf_loop_depth_ = 0;
   // When cf_exec_conditional_merge_ is not null:
   // If the current exec conditional is based on a bool constant: the number of
   // the bool constant.

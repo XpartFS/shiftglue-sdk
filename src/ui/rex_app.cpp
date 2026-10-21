@@ -10,6 +10,7 @@
  */
 
 #include <rex/rex_app.h>
+#include <rex/session_probe.h>
 
 #include <cstdlib>
 
@@ -20,6 +21,7 @@
 #include <rex/filesystem.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
+#include <rex/ppc/probe.h>
 #include <rex/ui/overlay/achievement_toast.h>
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
@@ -180,7 +182,7 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    log_config.log_dir = rex::path_to_utf8(exe_dir / "logs");
   }
 
   rex::InitLogging(log_config);
@@ -192,21 +194,21 @@ bool ReXApp::SetupEnvironment() {
   OnPostInitLogging();
 
   if (std::filesystem::exists(config_path_))
-    REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
+    REXLOG_DEBUG("Loaded config: {}", rex::path_to_utf8(config_path_.filename()));
 
   REXLOG_DEBUG("{} starting", GetName());
   if (!game_data_root_.empty()) {
-    REXLOG_DEBUG("  Game directory: {}", game_data_root_.string());
+    REXLOG_DEBUG("  Game directory: {}", rex::path_to_utf8(game_data_root_));
   }
   if (!user_data_root_.empty()) {
-    REXLOG_DEBUG("  User data:      {}", user_data_root_.string());
+    REXLOG_DEBUG("  User data:      {}", rex::path_to_utf8(user_data_root_));
   }
   if (!update_data_root_.empty()) {
-    REXLOG_DEBUG("  Update data:    {}", update_data_root_.string());
+    REXLOG_DEBUG("  Update data:    {}", rex::path_to_utf8(update_data_root_));
   }
-  REXLOG_DEBUG("  Cache root:     {}", cache_root_.string());
+  REXLOG_DEBUG("  Cache root:     {}", rex::path_to_utf8(cache_root_));
   if (!metadata_root_.empty()) {
-    REXLOG_DEBUG("  Metadata root:  {}", metadata_root_.string());
+    REXLOG_DEBUG("  Metadata root:  {}", rex::path_to_utf8(metadata_root_));
   }
 
   return true;
@@ -220,7 +222,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     return false;
   }
   if (!std::filesystem::is_directory(paths.game_data_root)) {
-    auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
+    auto msg =
+        fmt::format("--game_data_root does not exist: {}", rex::path_to_utf8(paths.game_data_root));
     REXLOG_ERROR("{}", msg);
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
@@ -288,7 +291,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
     auto xex_host = paths.game_data_root / host_tail;
     if (!std::filesystem::is_regular_file(xex_host)) {
-      auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
+      auto msg = fmt::format("Entrypoint XEX not found: {}", rex::path_to_utf8(xex_host));
       REXLOG_ERROR("{}", msg);
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
       return false;
@@ -404,9 +407,11 @@ bool ReXApp::SetupPresentation() {
     return false;
   }
 
-  // Set window title with SDK build stamp
-  std::string title = std::string(GetName()) + " " + REXGLUE_BUILD_TITLE;
-  window_->SetTitle(title);
+  // The host's build label when it set one, else the SDK's stamp.
+  std::string label = rex::ui::GetBuildLabel();
+  window_->SetTitle(label == REXGLUE_BUILD_STAMP
+                        ? std::string(GetName()) + " " + REXGLUE_BUILD_TITLE
+                        : label);
 
   window_->AddListener(this);
   window_->AddInputListener(this, 0);
@@ -553,6 +558,8 @@ void ReXApp::LaunchModule() {
     main_thread->Resume();
 
     module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
+      // This is the host launcher join, not a guest kernel wait.
+      session_probe::Suppress host_join;
       main_thread->Wait(0, 0, 0, nullptr);
       OnGuestThreadExit(main_thread.get());
       REXLOG_INFO("Execution complete");
@@ -590,6 +597,12 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   // lock still held by a straggler TerminateTitle left running. Flush (not
   // ShutdownLogging, which frees loggers a straggler may still use); the OS
   // reclaims the rest.
+  // The probe build's counts would be lost with the process; write them here.
+  if (runtime_ && rex::ppc::ProbeActive()) {
+    auto path = runtime_->user_data_root() / "logs" / "probe.json";
+    if (rex::ppc::ProbeDump(path))
+      REXLOG_INFO("Probe data written to {}", path.string());
+  }
   REXLOG_INFO("Title terminated; hard-exiting process.");
   rex::FlushLogging();
   std::_Exit(0);
